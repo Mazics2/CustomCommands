@@ -1,0 +1,240 @@
+# ==============================================================================
+#  CustomCommands - Örnek Yapılandırma Dosyası (customcommands.toml)
+#  (CSS-CreateCustomCommands eklentisinin gelişmiş SwiftlyS2 karşılığı)
+# ==============================================================================
+#  Dosya Konumu:
+#    csgo/addons/swiftlys2/configs/plugins/CustomCommands/customcommands.toml
+#    (veya csgo/addons/swiftlys2/plugins/CustomCommands/customcommands.toml)
+#    Ayrıca çoklu dosya desteği için aynı klasördeki "commands/*.toml" dosyaları da
+#    otomatik olarak taranır ve yüklenir!
+#
+#  Oyun İçi Görsel Yönetim Menüsü : !komutmenu (veya !ccmenu)
+#  Oyuncu Komut Listesi           : !komutlar  (veya !commands, !yardim)
+#  Hızlı Komut Ekleme             : !komutekle <komut> <chat|client|server|action> "<değer>" [yetki]
+#  Hızlı Komut Silme              : !komutsil <id_veya_komut>
+#  Canlı Yeniden Yükleme          : !komutreload (veya !ccreload)
+# ==============================================================================
+
+[settings]
+enabled = true
+enable_prefix = true
+prefix = "[gold][Sunucu][default]"
+
+# true yapılırsa oyuncuların yazdığı !dc, !kill gibi komut mesajları genel sohbette görünmez
+hide_chat_triggers = false
+
+default_html_duration_ms = 5000
+default_cooldown_seconds = 1.0
+
+# "admin" ve "root" yetkisine sahip yetkililer tüm özel komut yetki kontrollerinden geçsin mi?
+root_bypasses_permissions = true
+
+show_no_permission_message = true
+no_permission_message = "[lightred]Bu komutu kullanmak için yetkiniz yok![default]"
+
+show_cooldown_message = true
+cooldown_message = "[lightred]Bu komutu tekrar kullanmak için [gold]{COOLDOWN} sn[lightred] beklemelisiniz.[default]"
+
+only_alive_message = "[lightred]Bu komutu sadece hayattayken kullanabilirsiniz![default]"
+only_dead_message = "[lightred]Bu komutu sadece ölüyken kullanabilirsiniz![default]"
+wrong_team_message = "[lightred]Bu komutu mevcut takımınızda kullanamazsınız![default]"
+
+server_name_override = ""
+server_domain = "oyun.sunucunuz.com"
+discord_invite = "discord.gg/sunucunuz"
+website_url = "www.sunucunuz.com"
+
+# commands/ alt klasöründeki ek .toml dosyaları da otomatik yüklensin mi?
+load_extra_command_files = true
+freeze_while_menu_open = true
+log_to_console = false
+debug = false
+
+
+[admin_commands]
+menu_command = "komutmenu"              # !komutmenu (veya !ccmenu, !customcommands)
+list_command = "komutlar"               # !komutlar  (veya !commands, !yardim)
+add_command = "komutekle"               # !komutekle <komut> <tip> "<değer>" [yetki]
+remove_command = "komutsil"             # !komutsil <id_veya_komut>
+run_command = "komutcalistir"           # !komutcalistir <id_veya_komut>
+reload_command = "komutreload"          # !komutreload (veya !ccreload)
+admin_permission = "customcommands.admin"
+
+
+# ==============================================================================
+#  ÖZEL KOMUT TANIMLARI ([[commands]])
+# ==============================================================================
+#  Her [[commands]] bloğunda şu özellikleri kullanabilirsiniz:
+#    triggers        = ["dc", "discord"]   # (!dc, /dc, sw_dc, dc olarak çalışır)
+#    permission      = "admin"             # ("admin", "vip", "!vip" veya boş "" = herkes)
+#    permissions     = ["vip", "admin"]    # (Çoklu yetki listesi)
+#    requires_all_permissions = false      # (true = tüm yetkiler şart, false = biri yeterli)
+#    alive_state     = "any"               # ("any" = farketmez, "alive" = yaşayan, "dead" = ölü)
+#    teams           = ["T", "CT"]         # (Boş bırakılırsa tüm takımlar)
+#    maps            = ["de_dust2", "surf_"] # (Boş bırakılırsa tüm haritalar)
+#    cooldown_seconds = 3.0                # (Oyuncu başına bekleme süresi)
+#    target          = "caller"            # ("caller" = sadece yazan, "all" = tüm sunucu, "team" = takımı)
+#    hide_chat       = true                # (Yazılan !komut mesajını sohbette gizler)
+#    chat / chat_lines / html / center / alert / console -> Çıktı mesajları
+#    client_commands = ["sw_bring @all"]   # (Komutu yazan OYUNCU adına çalıştırılır!)
+#    server_commands = ["mp_restartgame 1"]# (SUNUCU KONSOLUNDA çalıştırılır!)
+#    player_action   = "suicide"           # ("suicide", "spec", "t", "ct", "respawn", "strip", "freeze", "unfreeze", "noclip", "hp:100", "armor:100", "speed:1.5", "gravity:0.5")
+# ==============================================================================
+
+# 1) !dc / !discord -> Discord davet adresi (Chat + Zengin CenterHTML)
+[[commands]]
+id = "discord"
+title = "Discord Sunucusu"
+description = "Discord davet adresimizi gösterir."
+enabled = true
+triggers = ["dc", "discord"]
+target = "caller"
+cooldown_seconds = 3.0
+chat_lines = [
+    "💬 [lime]Resmi Discord Sunucumuz:[default] [lightblue]{DISCORD}[default]",
+    "🌐 [gold]Web Sitemiz:[default] [lime]{WEBSITE}[default] | [gold]IP:[default] {DOMAIN}"
+]
+html = "<font class='fontSize-m' color='#38BDF8'><b>💬 DISCORD TOPLULUĞUMUZ</b></font><br><font class='fontSize-sm' color='#F8FAFC'>Davet Linki: <font color='#4ADE80'><b>{DISCORD}</b></font></font><br><font class='fontSize-xs' color='#FACC15'>Web: {WEBSITE}</font>"
+html_duration_ms = 5000
+
+# 2) !site / !web / !market / !vip -> Web sitesi ve VIP mağaza bilgisi
+[[commands]]
+id = "website"
+title = "Web Sitesi & Market"
+description = "Web sitemizi ve VIP/Market adresini gösterir."
+enabled = true
+triggers = ["site", "web", "market", "store", "vip"]
+target = "caller"
+cooldown_seconds = 3.0
+chat = "🛒 [gold]VIP & Market Adresimiz:[default] [lime]{WEBSITE}[default] | Destek için: [lightblue]{DISCORD}[default]"
+html = "<font class='fontSize-m' color='#FACC15'><b>★ WEB SİTESİ & MARKET ★</b></font><br><font class='fontSize-sm' color='#F8FAFC'>Adres: <font color='#38BDF8'><b>{WEBSITE}</b></font></font>"
+html_duration_ms = 5000
+
+# 3) !ip / !sunucu -> Sunucu IP ve Oyuncu Durumu
+[[commands]]
+id = "sunucu_ip"
+title = "Sunucu Bilgisi & IP"
+description = "Sunucu IP adresini ve aktif oyuncu durumunu gösterir."
+enabled = true
+triggers = ["ip", "sunucu", "server"]
+target = "caller"
+cooldown_seconds = 3.0
+chat = "🌐 [lime]{SERVERNAME}[default] | IP: [gold]{DOMAIN}[default] ({SERVERIP}) | Harita: [lightblue]{MAP}[default] | Oyuncular: [lime]{PLAYERS}/{MAXPLAYERS}[default]"
+
+# 4) !kurallar / !rules -> Çok satırlı sunucu kuralları
+[[commands]]
+id = "kurallar"
+title = "Sunucu Kuralları"
+description = "Temel sunucu kurallarını listeler."
+enabled = true
+triggers = ["kurallar", "rules", "kural"]
+target = "caller"
+cooldown_seconds = 5.0
+chat_lines = [
+    "[gold]══════════════ SUNUCU KURALLARI ══════════════[default]",
+    "[lime]1.[default] Hile, makro ve 3. parti yazılım kullanımı kalıcı ban sebebidir.",
+    "[lime]2.[default] Ailevi/dini değerlere küfür ve ağır hakaret yasaktır.",
+    "[lime]3.[default] Mikrofon ve sohbet spamı yapmak yasaktır.",
+    "[gold]══════════════════════════════════════════════[default]"
+]
+
+# 5) !kill / !intihar -> Oyuncuyu öldürür (İntihar etme komutu)
+[[commands]]
+id = "intihar"
+title = "İntihar Et (!kill)"
+description = "Hayattayken anında intihar etmenizi sağlar."
+enabled = true
+triggers = ["kill", "intihar", "slayme", "suicide"]
+alive_state = "alive"
+cooldown_seconds = 5.0
+hide_chat = true
+target = "caller"
+player_action = "suicide"
+chat = "💀 [lightred]İntihar ettiniz![default]"
+
+# 6) !spec / !afk / !izleyici -> İzleyici takımına geçme
+[[commands]]
+id = "izleyici_gec"
+title = "İzleyiciye Geç (!spec)"
+description = "Sizi hızlıca İzleyici (Spectator) takımına geçirir."
+enabled = true
+triggers = ["spec", "afk", "izleyici"]
+cooldown_seconds = 3.0
+hide_chat = true
+target = "caller"
+player_action = "spec"
+chat = "👁️ [lightblue]İzleyici (Spectator) takımına geçtiniz.[default]"
+
+# 7) !gelherkes / !bringall -> Komutu yazan yetkiliye sw_bring @all çalıştırtır
+[[commands]]
+id = "gel_herkes"
+title = "Herkesi Yanına Çek (!gelherkes)"
+description = "Tüm oyuncuları komutu yazan yetkilinin yanına ışınlar (sw_bring @all)."
+enabled = true
+triggers = ["gelherkes", "herkesigetir", "bringall"]
+permission = "admin"
+alive_state = "alive"
+cooldown_seconds = 2.0
+hide_chat = true
+target = "all"
+client_commands = ["sw_bring @all"]
+chat = "⚡ Yetkili [lime]{NAME}[default] tüm oyuncuları yanına çekti!"
+
+# 8) !getir <hedef> -> Komutu yazan yetkiliye sw_bring {ARG1} çalıştırtır
+[[commands]]
+id = "oyuncu_getir"
+title = "Oyuncuyu Yanına Çek (!getir)"
+description = "Belirtilen oyuncuyu yanınıza çeker (sw_bring <hedef>)."
+enabled = true
+triggers = ["getir", "cek"]
+permission = "admin"
+min_args = 1
+usage = "!getir <oyuncu_adı / @t / @ct / @all>"
+hide_chat = true
+target = "caller"
+client_commands = ["sw_bring {ARG1}"]
+chat = "⚡ [gold]{ARG1}[default] yanınıza çekildi."
+
+# 9) !git <hedef> -> Komutu yazan yetkiliye sw_goto {ARG1} çalıştırtır
+[[commands]]
+id = "oyuncuya_git"
+title = "Oyuncunun Yanına Git (!git)"
+description = "Belirtilen oyuncunun yanına ışınlanır (sw_goto <hedef>)."
+enabled = true
+triggers = ["git", "isinlan"]
+permission = "admin"
+min_args = 1
+usage = "!git <oyuncu_adı>"
+hide_chat = true
+target = "caller"
+client_commands = ["sw_goto {ARG1}"]
+chat = "⚡ [gold]{ARG1}[default] oyuncusunun yanına ışınlandınız."
+
+# 10) !rr / !restart -> Sunucu konsoluna mp_restartgame 1 gönderir
+[[commands]]
+id = "raunt_yenile"
+title = "Maçı Yeniden Başlat (!rr)"
+description = "Oyunu 1 saniye içinde yeniden başlatır (mp_restartgame 1)."
+enabled = true
+triggers = ["rr", "restart"]
+permission = "admin"
+cooldown_seconds = 3.0
+hide_chat = true
+target = "all"
+server_commands = ["mp_restartgame 1"]
+chat = "🔄 Yetkili [lime]{NAME}[default] maçı yeniden başlattı!"
+center = "🔄 Maç Yeniden Başlatılıyor!"
+
+# 11) !warmupbitir -> Sunucu konsoluna mp_warmup_end gönderir
+[[commands]]
+id = "isinma_bitir"
+title = "Isınmayı Bitir (!warmupbitir)"
+description = "Isınma (Warmup) süresini anında sonlandırır."
+enabled = true
+triggers = ["warmupbitir", "isinmabitir", "endwarmup"]
+permission = "admin"
+hide_chat = true
+target = "all"
+server_commands = ["mp_warmup_end"]
+chat = "🔥 Yetkili [lime]{NAME}[default] ısınma süresini sonlandırdı!"
+
