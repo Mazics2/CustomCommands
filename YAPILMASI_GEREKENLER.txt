@@ -1,0 +1,30 @@
+================================================================================
+                CUSTOMCOMMANDS - ÖZEL SOHBET VE KONSOL KOMUTLARI
+                           YAPILMASI GEREKENLER & ENTEGRASYON
+================================================================================
+Eklenti: CustomCommands (v1.0.0)
+Repo: https://github.com/Mazics2/CustomCommands.git
+
+--------------------------------------------------------------------------------
+1. DURUM & ENTEGRASYON
+--------------------------------------------------------------------------------
+[✓] 1. Menü ve Komut Tetikleyicileri:
+    - `!dc`, `!discord`, `!steam`, `!grup`, `!yetki`, `!vip`, `!kurallar` gibi kısayolları yönetir.
+    - Sohbete mesaj basma, konsol komutu çalıştırma veya MenuApi sayfalarını açma aksiyonları desteklenir.
+
+[✓] 2. MenuApi Uyumluluğu:
+    - SwiftlyS2-MenuApi arayüzüne başarıyla bağlanır.
+    - ICvar tablosu çökmesini önleyen güvenli ertelemeli komut kaydı mimarisine sahiptir.
+
+--------------------------------------------------------------------------------
+2. KOMUTLAR
+--------------------------------------------------------------------------------
+* `!cc` / `!customcommands` : Özel komut yönetim menüsü.
+* `sw_cc_reload` : Komut yapılandırma dosyasını yeniden yükler.
+
+--------------------------------------------------------------------------------
+3. ORTAĞIMIN YAPMASI GEREKENLER (TODO)
+--------------------------------------------------------------------------------
+1. `commands.json` / `commands.toml`:
+   - Sunucunuzun oyuncularına duyurmak istediği tüm sohbet kısayollarını dosya üzerinden güncelleyin.
+================================================================================

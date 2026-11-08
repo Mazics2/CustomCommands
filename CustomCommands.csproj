@@ -16,6 +16,13 @@
     <PackageReference Include="Tomlyn" Version="0.17.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\SwiftlyS2-MenuApi\MenuApi.Contract\MenuApi.Contract.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+
   <!--
     Yerel CS2 sunucusu mevcutsa build sonrasi dogrudan sunucu eklenti klasorune kopyalar.
   -->

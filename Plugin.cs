@@ -2,6 +2,7 @@ using CustomCommands.Config;
 using CustomCommands.Core;
 using CustomCommands.Models;
 using CustomCommands.Utils;
+using MenuApi.API;
 using Microsoft.Extensions.Logging;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.Commands;
@@ -37,6 +38,7 @@ public class Plugin(ISwiftlyCore core) : BasePlugin(core)
     private ConfigLoader? _configLoader;
     private CustomCommandService? _commandService;
     private CustomCommandAdminMenu? _adminMenu;
+    private IMenuApi? _menuApi;
 
     private readonly List<Guid> _commandGuids = new();
     private Guid _chatHookGuid;
@@ -69,7 +71,10 @@ public class Plugin(ISwiftlyCore core) : BasePlugin(core)
             _config,
             _commandService,
             ScheduleRegisterAllCommands,
-            p => ExecuteReloadCommand(p, null));
+            p => ExecuteReloadCommand(p, null))
+        {
+            MenuApi = _menuApi
+        };
         _commandService.SetMenuOpenPredicate(slot => _adminMenu.IsMenuOpen(slot));
 
         RegisterAllCommands();
@@ -82,6 +87,31 @@ public class Plugin(ISwiftlyCore core) : BasePlugin(core)
             _config.Commands.Count,
             _config.AdminCommands.MenuCommand,
             _config.AdminCommands.ListCommand);
+    }
+
+    public override void UseSharedInterface(IInterfaceManager interfaceManager)
+    {
+        if (interfaceManager.HasSharedInterface("MenuApi"))
+        {
+            try
+            {
+                _menuApi = interfaceManager.GetSharedInterface<IMenuApi>("MenuApi");
+                if (_adminMenu != null)
+                {
+                    _adminMenu.MenuApi = _menuApi;
+                }
+                Core.Logger.LogInformation("[CustomCommands] SwiftlyS2-MenuApi arayüzü bağlandı.");
+            }
+            catch (Exception ex)
+            {
+                Core.Logger.LogError(ex, "[CustomCommands] SwiftlyS2-MenuApi bağlanırken hata oluştu.");
+            }
+        }
+        else
+        {
+            _menuApi = null;
+            if (_adminMenu != null) _adminMenu.MenuApi = null;
+        }
     }
 
     public override void Unload()
@@ -511,6 +541,12 @@ public class Plugin(ISwiftlyCore core) : BasePlugin(core)
         if (visibleCommands.Count == 0)
         {
             _commandService.SendDirectFeedback(caller, ctx, "[grey]Kullanabileceğiniz aktif bir özel komut bulunmuyor.[default]");
+            return;
+        }
+
+        if (PlayerHelper.IsUsable(caller) && _adminMenu != null && _adminMenu.MenuApi != null)
+        {
+            _adminMenu.OpenPlayerCommandMenu(caller!, visibleCommands);
             return;
         }
 

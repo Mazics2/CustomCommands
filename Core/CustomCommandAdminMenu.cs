@@ -3,6 +3,7 @@ using System.Text;
 using CustomCommands.Config;
 using CustomCommands.Models;
 using CustomCommands.Utils;
+using MenuApi.API;
 using Microsoft.Extensions.Logging;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.Events;
@@ -79,6 +80,8 @@ public sealed class CustomCommandAdminMenu
     private readonly Action<IPlayer> _onReloadRequested;
     private PluginConfig _config;
 
+    public IMenuApi? MenuApi { get; set; }
+
     private readonly Dictionary<int, Session> _sessions = new();
     private readonly Dictionary<int, (string Prompt, Action<IPlayer, string> Callback)> _pendingInput = new();
     private readonly Dictionary<int, (string Html, float Time)> _lastHtml = new();
@@ -126,6 +129,8 @@ public sealed class CustomCommandAdminMenu
             Cursor = c;
             return true;
         }
+
+        public bool CanGoBack => _history.Count > 0;
     }
 
     public CustomCommandAdminMenu(
@@ -146,10 +151,29 @@ public sealed class CustomCommandAdminMenu
 
     public void UpdateConfig(PluginConfig config) => _config = config;
 
-    public bool IsMenuOpen(int slot) => _sessions.ContainsKey(slot);
+    public bool IsMenuOpen(int slot)
+    {
+        if (_sessions.ContainsKey(slot)) return true;
+        if (MenuApi != null)
+        {
+            var p = _core.PlayerManager.GetPlayer(slot);
+            if (PlayerHelper.IsUsable(p) && MenuApi.HasActiveMenu(p!))
+            {
+                var active = MenuApi.GetActiveMenu(p!);
+                if (active != null && active.Id.StartsWith("cc.", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
 
     public void Toggle(IPlayer admin)
     {
+        if (MenuApi != null)
+        {
+            Open(admin);
+            return;
+        }
         if (IsMenuOpen(admin.Slot)) Close(admin);
         else Open(admin);
     }
@@ -161,13 +185,130 @@ public sealed class CustomCommandAdminMenu
             LastButtons = admin.PressedButtons,
             LastKeyTime = PlayerHelper.SafeCurrentTime(_core)
         };
+
+        if (MenuApi != null)
+        {
+            RenderMenuApiPage(admin, 0);
+            return;
+        }
+
         SetFrozen(admin, true);
         _service.Reply(admin, "Özel Komut yönetim menüsü açıldı! [lime]W/S[default]: Gezin | [lime]A/D[default]: Değiştir | [lime]E[default]: Seç | [lime]R[default]: Geri/Kapat");
+    }
+
+    public void OpenPlayerCommandMenu(IPlayer player, IReadOnlyList<CustomCommandEntry> visibleCommands)
+    {
+        if (MenuApi == null) return;
+
+        var builder = MenuApi.CreateBuilder($"cc.player.{player.Slot}", "✦ ÖZEL KOMUTLAR MENÜSÜ ✦")
+            .SetSubtitle($"Kullanılabilir {visibleCommands.Count} Komut • Tıklayarak Çalıştırın")
+            .SetTheme(MenuTheme.Blue)
+            .SetItemsPerPage(7)
+            .SetTimeout(TimeSpan.FromSeconds(45))
+            .EnableSounds(true)
+            .EnableSlotSelection(true)
+            .EnableChatSelection(true);
+
+        foreach (var entry in visibleCommands)
+        {
+            var cmd = entry;
+            var desc = !string.IsNullOrWhiteSpace(cmd.Description) ? cmd.Description : cmd.Label;
+            string label = $"{cmd.TriggersDisplay} — {desc}";
+
+            builder.AddItem(label, ctx =>
+            {
+                _service.Execute(ctx.Player, cmd, cmd.PrimaryTrigger, Array.Empty<string>(), ctx: null);
+            }, "#4ADE80", enabled: true, closeOnSelect: true);
+        }
+
+        builder.Open(player, 0);
+    }
+
+    private void RenderMenuApiPage(IPlayer admin, int pageIndex = 0)
+    {
+        if (MenuApi == null) return;
+        if (!_sessions.TryGetValue(admin.Slot, out var session)) return;
+
+        var page = session.Current(admin);
+        var builder = MenuApi.CreateBuilder($"cc.admin.{admin.Slot}", $"✦ {page.Title} ✦")
+            .SetTheme(MenuTheme.Blue)
+            .SetItemsPerPage(7)
+            .SetTimeout(TimeSpan.FromSeconds(60))
+            .EnableSounds(true)
+            .EnableSlotSelection(true)
+            .EnableChatSelection(true);
+
+        if (!string.IsNullOrWhiteSpace(page.Subtitle))
+        {
+            builder.SetSubtitle(page.Subtitle);
+        }
+
+        foreach (var row in page.Rows)
+        {
+            var r = row;
+            string valStr = string.IsNullOrWhiteSpace(r.Value) ? "" : $" [{r.Value}]";
+            string text = $"{r.Label}{valStr}";
+            string color = r.Style switch
+            {
+                RowStyle.Danger => "#F87171",
+                RowStyle.Accent => "#38BDF8",
+                RowStyle.On => "#4ADE80",
+                RowStyle.Off => "#F87171",
+                RowStyle.Muted => "#94A3B8",
+                _ => "#E2E8F0"
+            };
+
+            bool isInteractive = r.OnSelect != null || r.OnAdjust != null;
+            if (!isInteractive)
+            {
+                builder.AddText(text, color);
+                continue;
+            }
+
+            builder.AddItem(text, ctx =>
+            {
+                if (!_sessions.ContainsKey(ctx.Player.Slot)) return;
+                if (r.OnSelect != null)
+                {
+                    r.OnSelect(ctx.Player);
+                }
+                else
+                {
+                    r.OnAdjust?.Invoke(ctx.Player, +1);
+                }
+
+                if (_sessions.ContainsKey(ctx.Player.Slot) && !_pendingInput.ContainsKey(ctx.Player.Slot))
+                {
+                    RenderMenuApiPage(ctx.Player, r.OnSelect != null ? 0 : ctx.PageIndex);
+                }
+            }, color, enabled: r.Style != RowStyle.Muted, closeOnSelect: false);
+        }
+
+        if (session.CanGoBack)
+        {
+            builder.AddItem("⬅️ Geri Dön", ctx =>
+            {
+                if (_sessions.TryGetValue(ctx.Player.Slot, out var s))
+                {
+                    _pendingInput.Remove(ctx.Player.Slot);
+                    if (s.Back())
+                        RenderMenuApiPage(ctx.Player, 0);
+                    else
+                        Close(ctx.Player);
+                }
+            }, "#FFB000", enabled: true, closeOnSelect: false);
+        }
+
+        builder.Open(admin, pageIndex);
     }
 
     public void Close(IPlayer admin)
     {
         _pendingInput.Remove(admin.Slot);
+        if (MenuApi != null && MenuApi.HasActiveMenu(admin))
+        {
+            MenuApi.CloseMenu(admin);
+        }
         if (_sessions.Remove(admin.Slot))
         {
             SetFrozen(admin, false);
@@ -224,16 +365,24 @@ public sealed class CustomCommandAdminMenu
             trimmed.Equals("cancel", StringComparison.OrdinalIgnoreCase))
         {
             _service.Reply(admin, "[lightred]Giriş iptal edildi.[default]");
+            if (MenuApi != null && _sessions.ContainsKey(admin!.Slot))
+                RenderMenuApiPage(admin, 0);
             return true;
         }
 
         pending.Callback(admin!, trimmed);
+        if (MenuApi != null && _sessions.ContainsKey(admin!.Slot))
+            RenderMenuApiPage(admin, 0);
         return true;
     }
 
     private void PromptInput(IPlayer admin, string prompt, Action<IPlayer, string> callback)
     {
         _pendingInput[admin.Slot] = (prompt, callback);
+        if (MenuApi != null && MenuApi.HasActiveMenu(admin))
+        {
+            MenuApi.CloseMenu(admin);
+        }
         _service.Reply(admin, $"[gold]{prompt}[default] (İptal için sohbete [lightred]iptal[default] yazın)");
     }
 
@@ -241,6 +390,7 @@ public sealed class CustomCommandAdminMenu
 
     public void OnTick()
     {
+        if (MenuApi != null) return;
         if (_sessions.Count == 0) return;
 
         foreach (var kv in _sessions.ToList())
@@ -281,6 +431,7 @@ public sealed class CustomCommandAdminMenu
 
     public void OnKeyPressed(IPlayer admin, KeyKind key)
     {
+        if (MenuApi != null) return;
         if (!_sessions.TryGetValue(admin.Slot, out var session)) return;
 
         var now = PlayerHelper.SafeCurrentTime(_core);
