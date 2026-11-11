@@ -1,39 +1,31 @@
-using System.Net;
-using System.Text;
+using System.Text.RegularExpressions;
 using CustomCommands.Config;
 using CustomCommands.Models;
 using CustomCommands.Utils;
-using MenuApi.API;
 using Microsoft.Extensions.Logging;
 using SwiftlyS2.Shared;
-using SwiftlyS2.Shared.Events;
+using SwiftlyS2.Shared.Menu;
+using SwiftlyS2.Shared.Menu.Components;
 using SwiftlyS2.Shared.Players;
-using SwiftlyS2.Shared.SchemaDefinitions;
 
 namespace CustomCommands.Core;
 
 /// <summary>
-/// Adminler icin oyun ici gorsel (CenterHTML) ozel komut yonetim menusu (!komutmenu / !ccmenu).
-/// W/S: Yukari/Asagi | A/D: Deger degistir | E: Sec | R: Geri/Kapat
-/// Metin girisi gerektiginde bir sonraki chat mesajini yakalar.
+/// Adminler ve oyuncular icin SwiftlyS2 Core.Menu tabanli CustomCommands arayuzu (!komutmenu / !komutlar).
+/// CustomHUD, CenterHTML ve Chat rendererlariyla tam uyumludur.
 /// </summary>
 public sealed class CustomCommandAdminMenu
 {
-    private const int RowsPerPage = 6;
-    private const int HtmlDurationMs = 2000;
-    private const float ResendSeconds = 0.25f;
+    private const string MenuTag = "customcommands.menu";
 
-    private static readonly string[] TargetValues = { "caller", "all", "team" };
-    private static readonly string[] TargetLabels = { "Sadece Yazan", "Tüm Sunucu", "Sadece Takımı" };
+    private static readonly Regex HtmlTagRegex = new("<[^>]*>", RegexOptions.Compiled);
 
-    private static readonly string[] AliveValues = { "any", "alive", "dead" };
-    private static readonly string[] AliveLabels = { "Farketmez", "Sadece Yaşayan", "Sadece Ölü" };
-
-    private static readonly string[] PermissionPresets = { "", "admin", "vip", "!vip", "root" };
-    private static readonly string[] PermissionPresetLabels = { "Herkes", "admin", "vip", "!vip (VIP Olmayan)", "root" };
+    private static readonly string[] TargetValues = ["caller", "all", "team"];
+    private static readonly string[] AliveValues = ["any", "alive", "dead"];
+    private static readonly string[] PermissionPresets = ["", "admin", "vip", "!vip", "root"];
 
     private static readonly string[] ActionPresets =
-    {
+    [
         "",
         "suicide",
         "spec",
@@ -46,32 +38,32 @@ public sealed class CustomCommandAdminMenu
         "noclip",
         "hp:100",
         "armor:100"
-    };
+    ];
 
-    private static readonly string[] ActionPresetLabels =
+    private sealed class DangerSubmenuComponent : SubmenuComponent
     {
-        "Yok",
-        "İntihar Et (suicide)",
-        "İzleyiciye Geç (spec)",
-        "T Takımına Geç (t)",
-        "CT Takımına Geç (ct)",
-        "Yeniden Doğur (respawn)",
-        "Silahları Temizle (strip)",
-        "Dondur (freeze)",
-        "Çöz (unfreeze)",
-        "Noclip Aç/Kapat (noclip)",
-        "Can 100 Yap (hp:100)",
-        "Zırh 100 Yap (armor:100)"
-    };
+        public DangerSubmenuComponent(string text, Func<IMenuSession, IMenu?> factory, string? id = null)
+            : base(text, factory, id)
+        {
+        }
 
-    private static readonly string[][] TeamPresets =
+        public override MenuNode Render(IMenuComponentRenderContext context)
+        {
+            var node = base.Render(context);
+            var raw = new MenuRawNode("customhud.panorama", "danger");
+            return node is MenuLineNode line
+                ? line with { Children = [.. line.Children, raw] }
+                : MenuLineNode.Of(node, raw);
+        }
+    }
+
+    private sealed class PageState
     {
-        Array.Empty<string>(),
-        new[] { "T" },
-        new[] { "CT" },
-        new[] { "SPEC" }
-    };
-    private static readonly string[] TeamPresetLabels = { "Herkes", "Sadece T", "Sadece CT", "Sadece İzleyici" };
+        public int? Focus { get; set; }
+        public object? FocusKey { get; set; }
+        public int RowsAt { get; set; }
+        public List<IMenuComponent> Rows { get; } = [];
+    }
 
     private readonly ISwiftlyCore _core;
     private readonly ConfigLoader _loader;
@@ -80,58 +72,8 @@ public sealed class CustomCommandAdminMenu
     private readonly Action<IPlayer> _onReloadRequested;
     private PluginConfig _config;
 
-    public IMenuApi? MenuApi { get; set; }
-
-    private readonly Dictionary<int, Session> _sessions = new();
-    private readonly Dictionary<int, (string Prompt, Action<IPlayer, string> Callback)> _pendingInput = new();
-    private readonly Dictionary<int, (string Html, float Time)> _lastHtml = new();
-    private readonly HashSet<int> _frozenSlots = new();
-
-    private enum RowStyle { Normal, Accent, On, Off, Danger, Muted }
-
-    private sealed record Row(
-        string Label,
-        string? Value = null,
-        bool Arrows = false,
-        RowStyle Style = RowStyle.Normal,
-        Action<IPlayer>? OnSelect = null,
-        Action<IPlayer, int>? OnAdjust = null);
-
-    private sealed class Page
-    {
-        public string Title { get; init; } = "";
-        public string Subtitle { get; init; } = "";
-        public List<Row> Rows { get; init; } = new();
-    }
-
-    private delegate Page PageBuilder(IPlayer admin);
-
-    private sealed class Session(PageBuilder root)
-    {
-        private readonly Stack<(PageBuilder Builder, int Cursor)> _history = new();
-        public PageBuilder Current { get; private set; } = root;
-        public int Cursor { get; set; }
-        public GameButtonFlags LastButtons { get; set; }
-        public float LastKeyTime { get; set; }
-
-        public void Push(PageBuilder next)
-        {
-            _history.Push((Current, Cursor));
-            Current = next;
-            Cursor = 0;
-        }
-
-        public bool Back()
-        {
-            if (_history.Count == 0) return false;
-            var (b, c) = _history.Pop();
-            Current = b;
-            Cursor = c;
-            return true;
-        }
-
-        public bool CanGoBack => _history.Count > 0;
-    }
+    private readonly Dictionary<int, List<IMenu>> _ownedMenus = new();
+    private readonly Dictionary<int, long> _lastToggleTick = new();
 
     public CustomCommandAdminMenu(
         ISwiftlyCore core,
@@ -153,417 +95,960 @@ public sealed class CustomCommandAdminMenu
 
     public bool IsMenuOpen(int slot)
     {
-        if (_sessions.ContainsKey(slot)) return true;
-        if (MenuApi != null)
-        {
-            var p = _core.PlayerManager.GetPlayer(slot);
-            if (PlayerHelper.IsUsable(p) && MenuApi.HasActiveMenu(p!))
-            {
-                var active = MenuApi.GetActiveMenu(p!);
-                if (active != null && active.Id.StartsWith("cc.", StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-        }
-        return false;
+        var player = _core.PlayerManager.GetPlayer(slot);
+        if (!PlayerHelper.IsUsable(player)) return false;
+
+        return _core.Menu.GetSession(player!) is { IsOpen: true, Menu.Tag: string tag } && tag == MenuTag;
     }
 
     public void Toggle(IPlayer admin)
     {
-        if (MenuApi != null)
+        if (!PlayerHelper.IsUsable(admin))
+            return;
+
+        long now = Environment.TickCount64;
+        if (_lastToggleTick.TryGetValue(admin.Slot, out long prev) && now - prev < 150)
+            return;
+        _lastToggleTick[admin.Slot] = now;
+
+        if (_core.Menu.GetSession(admin) is { IsOpen: true, Menu.Tag: string tag } && tag == MenuTag)
         {
-            Open(admin);
+            Close(admin);
             return;
         }
-        if (IsMenuOpen(admin.Slot)) Close(admin);
-        else Open(admin);
+
+        Open(admin);
     }
 
     public void Open(IPlayer admin)
     {
-        _sessions[admin.Slot] = new Session(BuildMainPage)
-        {
-            LastButtons = admin.PressedButtons,
-            LastKeyTime = PlayerHelper.SafeCurrentTime(_core)
-        };
-
-        if (MenuApi != null)
-        {
-            RenderMenuApiPage(admin, 0);
+        if (!PlayerHelper.IsUsable(admin))
             return;
-        }
 
-        SetFrozen(admin, true);
-        _service.Reply(admin, "Özel Komut yönetim menüsü açıldı! [lime]W/S[default]: Gezin | [lime]A/D[default]: Değiştir | [lime]E[default]: Seç | [lime]R[default]: Geri/Kapat");
+        Close(admin);
+        var menu = BuildMainMenu(admin.Slot);
+        menu.Open(admin);
     }
 
     public void OpenPlayerCommandMenu(IPlayer player, IReadOnlyList<CustomCommandEntry> visibleCommands)
     {
-        if (MenuApi == null) return;
+        if (!PlayerHelper.IsUsable(player))
+            return;
 
-        var builder = MenuApi.CreateBuilder($"cc.player.{player.Slot}", "✦ ÖZEL KOMUTLAR MENÜSÜ ✦")
-            .SetSubtitle($"Kullanılabilir {visibleCommands.Count} Komut • Tıklayarak Çalıştırın")
-            .SetTheme(MenuTheme.Blue)
-            .SetItemsPerPage(7)
-            .SetTimeout(TimeSpan.FromSeconds(45))
-            .EnableSounds(true)
-            .EnableSlotSelection(true)
-            .EnableChatSelection(true);
+        Close(player);
+
+        int ownerSlot = player.Slot;
+        var builder = _core.Menu.CreateMenu("customcommands.player")
+            .WithTitle("ÖZEL KOMUTLAR")
+            .AddHeader(new TextComponent($"Kullanılabilir {visibleCommands.Count} Komut • Çalıştırmak için seçin"));
 
         foreach (var entry in visibleCommands)
         {
             var cmd = entry;
-            var desc = !string.IsNullOrWhiteSpace(cmd.Description) ? cmd.Description : cmd.Label;
-            string label = $"{cmd.TriggersDisplay} — {desc}";
+            var rawDesc = !string.IsNullOrWhiteSpace(cmd.Description) ? cmd.Description : cmd.Label;
+            var desc = SafePreview(rawDesc, 40);
+            string text = $"{SafePreview(cmd.TriggersDisplay, 24)}\t{desc}";
 
-            builder.AddItem(label, ctx =>
+            builder.Add(new ButtonComponent(text, ctx =>
             {
                 _service.Execute(ctx.Player, cmd, cmd.PrimaryTrigger, Array.Empty<string>(), ctx: null);
-            }, "#4ADE80", enabled: true, closeOnSelect: true);
+                return ValueTask.CompletedTask;
+            })
+            {
+                CloseOnSelect = true
+            });
         }
 
-        builder.Open(player, 0);
-    }
-
-    private void RenderMenuApiPage(IPlayer admin, int pageIndex = 0)
-    {
-        if (MenuApi == null) return;
-        if (!_sessions.TryGetValue(admin.Slot, out var session)) return;
-
-        var page = session.Current(admin);
-        var builder = MenuApi.CreateBuilder($"cc.admin.{admin.Slot}", $"✦ {page.Title} ✦")
-            .SetTheme(MenuTheme.Blue)
-            .SetItemsPerPage(7)
-            .SetTimeout(TimeSpan.FromSeconds(60))
-            .EnableSounds(true)
-            .EnableSlotSelection(true)
-            .EnableChatSelection(true);
-
-        if (!string.IsNullOrWhiteSpace(page.Subtitle))
-        {
-            builder.SetSubtitle(page.Subtitle);
-        }
-
-        foreach (var row in page.Rows)
-        {
-            var r = row;
-            string valStr = string.IsNullOrWhiteSpace(r.Value) ? "" : $" [{r.Value}]";
-            string text = $"{r.Label}{valStr}";
-            string color = r.Style switch
-            {
-                RowStyle.Danger => "#F87171",
-                RowStyle.Accent => "#38BDF8",
-                RowStyle.On => "#4ADE80",
-                RowStyle.Off => "#F87171",
-                RowStyle.Muted => "#94A3B8",
-                _ => "#E2E8F0"
-            };
-
-            bool isInteractive = r.OnSelect != null || r.OnAdjust != null;
-            if (!isInteractive)
-            {
-                builder.AddText(text, color);
-                continue;
-            }
-
-            builder.AddItem(text, ctx =>
-            {
-                if (!_sessions.ContainsKey(ctx.Player.Slot)) return;
-                if (r.OnSelect != null)
-                {
-                    r.OnSelect(ctx.Player);
-                }
-                else
-                {
-                    r.OnAdjust?.Invoke(ctx.Player, +1);
-                }
-
-                if (_sessions.ContainsKey(ctx.Player.Slot) && !_pendingInput.ContainsKey(ctx.Player.Slot))
-                {
-                    RenderMenuApiPage(ctx.Player, r.OnSelect != null ? 0 : ctx.PageIndex);
-                }
-            }, color, enabled: r.Style != RowStyle.Muted, closeOnSelect: false);
-        }
-
-        if (session.CanGoBack)
-        {
-            builder.AddItem("⬅️ Geri Dön", ctx =>
-            {
-                if (_sessions.TryGetValue(ctx.Player.Slot, out var s))
-                {
-                    _pendingInput.Remove(ctx.Player.Slot);
-                    if (s.Back())
-                        RenderMenuApiPage(ctx.Player, 0);
-                    else
-                        Close(ctx.Player);
-                }
-            }, "#FFB000", enabled: true, closeOnSelect: false);
-        }
-
-        builder.Open(admin, pageIndex);
+        var menu = Track(ownerSlot, builder.Build());
+        menu.Open(player);
     }
 
     public void Close(IPlayer admin)
     {
-        _pendingInput.Remove(admin.Slot);
-        if (MenuApi != null && MenuApi.HasActiveMenu(admin))
+        if (!PlayerHelper.IsUsable(admin))
+            return;
+
+        if (_core.Menu.GetSession(admin) is { IsOpen: true, Menu.Tag: string tag } && tag == MenuTag)
         {
-            MenuApi.CloseMenu(admin);
+            _core.Menu.CloseFor(admin);
         }
-        if (_sessions.Remove(admin.Slot))
-        {
-            SetFrozen(admin, false);
-            if (_lastHtml.Remove(admin.Slot))
-            {
-                try { admin.SendCenterHTML(" ", 1); } catch { /* yoksay */ }
-            }
-        }
+
+        DisposeSlotMenus(admin.Slot);
     }
 
     public void OnPlayerDisconnected(int slot)
     {
-        _sessions.Remove(slot);
-        _pendingInput.Remove(slot);
-        _lastHtml.Remove(slot);
-        _frozenSlots.Remove(slot);
+        _lastToggleTick.Remove(slot);
+        DisposeSlotMenus(slot);
     }
 
     public void CloseAll()
     {
-        try
+        try { _core.Menu.CloseAll(); } catch { }
+
+        foreach (int slot in _ownedMenus.Keys.ToList())
         {
-            foreach (var p in _core.PlayerManager.GetAllPlayers().Where(PlayerHelper.IsUsable))
-            {
-                if (_sessions.ContainsKey(p!.Slot)) Close(p);
-            }
+            DisposeSlotMenus(slot);
         }
-        catch { /* yoksay */ }
-        _sessions.Clear();
-        _pendingInput.Clear();
-        _lastHtml.Clear();
-        _frozenSlots.Clear();
+        _ownedMenus.Clear();
     }
 
-    public bool TryConsumeChatInput(int playerId, string text)
+    private IMenu Track(int slot, IMenu menu)
     {
-        if (!_pendingInput.TryGetValue(playerId, out var pending)) return false;
-
-        var admin = _core.PlayerManager.GetPlayer(playerId);
-        if (!PlayerHelper.IsUsable(admin))
+        menu.Tag = MenuTag;
+        if (!_ownedMenus.TryGetValue(slot, out var list))
         {
-            _pendingInput.Remove(playerId);
-            return false;
+            list = new List<IMenu>();
+            _ownedMenus[slot] = list;
         }
-
-        var trimmed = (text ?? string.Empty).Trim();
-        if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed[^1] == '"')
-            trimmed = trimmed[1..^1].Trim();
-
-        _pendingInput.Remove(playerId);
-
-        if (trimmed.Equals("iptal", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.Equals("!iptal", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.Equals("cancel", StringComparison.OrdinalIgnoreCase))
-        {
-            _service.Reply(admin, "[lightred]Giriş iptal edildi.[default]");
-            if (MenuApi != null && _sessions.ContainsKey(admin!.Slot))
-                RenderMenuApiPage(admin, 0);
-            return true;
-        }
-
-        pending.Callback(admin!, trimmed);
-        if (MenuApi != null && _sessions.ContainsKey(admin!.Slot))
-            RenderMenuApiPage(admin, 0);
-        return true;
+        list.Add(menu);
+        return menu;
     }
 
-    private void PromptInput(IPlayer admin, string prompt, Action<IPlayer, string> callback)
+    private void DisposeSlotMenus(int slot)
     {
-        _pendingInput[admin.Slot] = (prompt, callback);
-        if (MenuApi != null && MenuApi.HasActiveMenu(admin))
-        {
-            MenuApi.CloseMenu(admin);
-        }
-        _service.Reply(admin, $"[gold]{prompt}[default] (İptal için sohbete [lightred]iptal[default] yazın)");
-    }
-
-    // ============================== TICK & INPUT ==============================
-
-    public void OnTick()
-    {
-        if (MenuApi != null) return;
-        if (_sessions.Count == 0) return;
-
-        foreach (var kv in _sessions.ToList())
-        {
-            try
-            {
-                var admin = _core.PlayerManager.GetPlayer(kv.Key);
-                if (!PlayerHelper.IsUsable(admin))
-                {
-                    OnPlayerDisconnected(kv.Key);
-                    continue;
-                }
-
-                PollButtons(admin!, kv.Value);
-                Render(admin!, kv.Value);
-            }
-            catch { /* yoksay */ }
-        }
-    }
-
-    private void PollButtons(IPlayer admin, Session session)
-    {
-        if (_config.Settings.FreezeWhileMenuOpen)
-            SetFrozen(admin, true);
-
-        var buttons = admin.PressedButtons;
-        var rising = buttons & ~session.LastButtons;
-        session.LastButtons = buttons;
-        if (rising == 0) return;
-
-        if ((rising & GameButtonFlags.W) != 0) OnKeyPressed(admin, KeyKind.W);
-        else if ((rising & GameButtonFlags.S) != 0) OnKeyPressed(admin, KeyKind.S);
-        else if ((rising & GameButtonFlags.A) != 0) OnKeyPressed(admin, KeyKind.A);
-        else if ((rising & GameButtonFlags.D) != 0) OnKeyPressed(admin, KeyKind.D);
-        else if ((rising & GameButtonFlags.E) != 0) OnKeyPressed(admin, KeyKind.E);
-        else if ((rising & GameButtonFlags.R) != 0) OnKeyPressed(admin, KeyKind.R);
-    }
-
-    public void OnKeyPressed(IPlayer admin, KeyKind key)
-    {
-        if (MenuApi != null) return;
-        if (!_sessions.TryGetValue(admin.Slot, out var session)) return;
-
-        var now = PlayerHelper.SafeCurrentTime(_core);
-        if (MathF.Abs(now - session.LastKeyTime) < 0.12f) return;
-        session.LastKeyTime = now;
-
-        var page = session.Current(admin);
-        var count = page.Rows.Count;
-        if (count == 0) return;
-        session.Cursor = Math.Clamp(session.Cursor, 0, count - 1);
-
-        switch (key)
-        {
-            case KeyKind.W:
-                session.Cursor = (session.Cursor - 1 + count) % count;
-                break;
-            case KeyKind.S:
-                session.Cursor = (session.Cursor + 1) % count;
-                break;
-            case KeyKind.A:
-                page.Rows[session.Cursor].OnAdjust?.Invoke(admin, -1);
-                break;
-            case KeyKind.D:
-                page.Rows[session.Cursor].OnAdjust?.Invoke(admin, +1);
-                break;
-            case KeyKind.E:
-                var r = page.Rows[session.Cursor];
-                if (r.OnSelect != null) r.OnSelect(admin);
-                else r.OnAdjust?.Invoke(admin, +1);
-                break;
-            case KeyKind.R:
-            case KeyKind.Esc:
-                _pendingInput.Remove(admin.Slot);
-                if (!session.Back()) Close(admin);
-                break;
-        }
-    }
-
-    private void Render(IPlayer admin, Session session)
-    {
-        var page = session.Current(admin);
-        if (page.Rows.Count > 0)
-            session.Cursor = Math.Clamp(session.Cursor, 0, page.Rows.Count - 1);
-
-        int pageIdx = session.Cursor / RowsPerPage;
-        int pageCount = Math.Max(1, (page.Rows.Count + RowsPerPage - 1) / RowsPerPage);
-        var slice = page.Rows.Skip(pageIdx * RowsPerPage).Take(RowsPerPage).ToList();
-        int selectedInSlice = session.Cursor - pageIdx * RowsPerPage;
-
-        var sb = new StringBuilder();
-        sb.Append($"<font class='fontSize-m' color='#38BDF8'><b>✦ {E(page.Title)} ✦</b></font>");
-        if (pageCount > 1)
-            sb.Append($" <font class='fontSize-s' color='#94A3B8'>[{pageIdx + 1}/{pageCount}]</font>");
-        sb.Append("<br>");
-
-        if (!string.IsNullOrEmpty(page.Subtitle))
-            sb.Append($"<font class='fontSize-xs' color='#CBD5E1'>{E(page.Subtitle)}</font><br>");
-
-        for (int i = 0; i < slice.Count; i++)
-        {
-            var row = slice[i];
-            bool sel = i == selectedInSlice;
-            var labelColor = sel ? "#FACC15" : row.Style switch
-            {
-                RowStyle.Danger => "#F87171",
-                RowStyle.Accent => "#38BDF8",
-                RowStyle.Muted => "#64748B",
-                _ => "#F8FAFC"
-            };
-
-            sb.Append("<font class='fontSize-sm'>");
-            sb.Append(sel ? "<font color='#FACC15'><b>➤ </b></font>" : "<font color='#475569'>• </font>");
-            sb.Append(sel
-                ? $"<font color='{labelColor}'><b>{E(row.Label)}</b></font>"
-                : $"<font color='{labelColor}'>{E(row.Label)}</font>");
-
-            if (!string.IsNullOrEmpty(row.Value))
-            {
-                var valColor = row.Style switch
-                {
-                    RowStyle.On => "#4ADE80",
-                    RowStyle.Off => "#F87171",
-                    _ => "#E2E8F0"
-                };
-                var v = row.Arrows ? $"◀ {E(row.Value)} ▶" : $"[{E(row.Value)}]";
-                sb.Append($" <font color='{valColor}'><b>{v}</b></font>");
-            }
-            sb.Append("</font><br>");
-        }
-
-        if (_pendingInput.TryGetValue(admin.Slot, out var pending))
-            sb.Append($"<font class='fontSize-s' color='#FBBF24'><b>💬 Sohbete yazın: {E(pending.Prompt)}</b></font><br>");
-
-        sb.Append("<font class='fontSize-xs' color='#94A3B8'>[W/S] Gezin • [A/D] Değiştir • [E] Seç • [R] Geri/Kapat</font>");
-
-        var html = sb.ToString();
-        var now = PlayerHelper.SafeCurrentTime(_core);
-        if (_lastHtml.TryGetValue(admin.Slot, out var last) && last.Html == html && MathF.Abs(now - last.Time) < ResendSeconds)
+        if (!_ownedMenus.TryGetValue(slot, out var list))
             return;
 
-        _lastHtml[admin.Slot] = (html, now);
-        try { admin.SendCenterHTML(html, HtmlDurationMs); } catch { /* yoksay */ }
-    }
-
-    private static string E(string s) => WebUtility.HtmlEncode(s);
-
-    private void SetFrozen(IPlayer player, bool freeze)
-    {
-        if (freeze && !_config.Settings.FreezeWhileMenuOpen) return;
-        if (!freeze && !_frozenSlots.Remove(player.Slot)) return;
-
-        try
+        foreach (var menu in list)
         {
-            var pawn = player.PlayerPawn;
-            if (pawn is not { IsValid: true }) return;
-            var target = freeze ? MoveType_t.MOVETYPE_NONE : MoveType_t.MOVETYPE_WALK;
-            if (pawn.MoveType != target)
-            {
-                pawn.MoveType = target;
-                pawn.ActualMoveType = target;
-                pawn.MoveTypeUpdated();
-            }
-            if (freeze)
-            {
-                _frozenSlots.Add(player.Slot);
-                pawn.AbsVelocity.X = 0f;
-                pawn.AbsVelocity.Y = 0f;
-                pawn.AbsVelocity.Z = 0f;
-            }
+            try { menu.Dispose(); } catch { }
         }
-        catch { /* yoksay */ }
+        list.Clear();
+        _ownedMenus.Remove(slot);
     }
+
+    // ============================== 1. ANA MENÜ ==============================
+
+    private IMenu BuildMainMenu(int ownerSlot)
+    {
+        IMenu? mainMenu = null;
+        var listMenu = BuildCommandsListMenu(ownerSlot);
+        var templatesMenu = BuildTemplatesMenu(ownerSlot);
+        var settingsMenu = BuildSettingsMenu(ownerSlot);
+
+        var createInput = CreateNewCommandInput(ownerSlot, () =>
+        {
+            listMenu.Parent ??= mainMenu;
+            return listMenu;
+        });
+
+        mainMenu = _core.Menu.CreateMenu("customcommands.admin")
+            .WithTitle("CUSTOMCOMMANDS YÖNETİM")
+            .AddHeader(new TextComponent
+            {
+                TextProvider = _ =>
+                {
+                    int activeCount = _config.Commands.Count(c => c.Enabled);
+                    string state = _config.Settings.Enabled ? "AÇIK" : "KAPALI";
+                    return $"{activeCount}/{_config.Commands.Count} aktif komut • Sistem: {state}";
+                }
+            })
+            .Add(new SubmenuComponent("Özel Komutları Yönet", listMenu, "list")
+            {
+                TextProvider = _ => $"Özel Komutları Yönet\t{_config.Commands.Count} komut"
+            })
+            .Add(createInput)
+            .Add(new SubmenuComponent("Hazır Şablonlardan Komut Ekle", templatesMenu, "templates"))
+            .Add(new SubmenuComponent("Genel Ayarlar", settingsMenu, "settings")
+            {
+                TextProvider = _ => $"Genel Ayarlar\t{(_config.Settings.Enabled ? "AÇIK" : "KAPALI")}"
+            })
+            .Add(new ButtonComponent("Config Dosyasını Yeniden Yükle", ctx =>
+            {
+                _onReloadRequested(ctx.Player);
+                ctx.Session.Invalidate();
+                return ValueTask.CompletedTask;
+            }))
+            .Build();
+
+        return Track(ownerSlot, mainMenu);
+    }
+
+    // ============================== 2. KOMUT LİSTESİ ==============================
+
+    private IMenu BuildCommandsListMenu(int ownerSlot)
+    {
+        var page = new PageState();
+        IMenu? listMenu = null;
+
+        var createInput = CreateNewCommandInput(ownerSlot, () => listMenu);
+
+        var builder = _core.Menu.CreateMenu("customcommands.list")
+            .WithTitle("ÖZEL KOMUT LİSTESİ")
+            .AddHeader(new TextComponent("Düzenlemek veya test etmek istediğiniz komutu seçin"))
+            .Add(createInput);
+
+        page.RowsAt = 1;
+        listMenu = Track(ownerSlot, builder.Build());
+
+        void Populate()
+        {
+            var rows = new List<IMenuComponent>();
+            foreach (var cmd in _config.Commands.ToList())
+            {
+                var entry = cmd;
+                var permBadge = string.IsNullOrWhiteSpace(entry.Permission) && entry.Permissions.Count == 0
+                    ? "Herkes"
+                    : entry.Permission ?? string.Join(",", entry.Permissions);
+                string statusText = $"{(entry.Enabled ? "AKTİF" : "KAPALI")} • {SafePreview(permBadge, 16)}";
+
+                rows.Add(new SubmenuComponent(
+                    $"{SafePreview(entry.TriggersDisplay, 22)}\t{statusText}",
+                    _ => BuildCommandEditMenu(ownerSlot, entry, listMenu))
+                {
+                    Tag = entry.Id
+                });
+            }
+
+            if (rows.Count == 0)
+            {
+                rows.Add(new TextComponent("Kayıtlı özel komut bulunmuyor"));
+            }
+
+            ReplaceRows(listMenu, page, rows);
+        }
+
+        listMenu.Opened += session =>
+        {
+            Populate();
+            RestoreFocus(session, page);
+        };
+
+        listMenu.FocusChanged += session =>
+        {
+            page.Focus = session.FocusedIndex;
+            page.FocusKey = (session.FocusedComponent as MenuComponentBase)?.Tag;
+        };
+
+        return listMenu;
+    }
+
+    private InputComponent CreateNewCommandInput(int ownerSlot, Func<IMenu?> listMenuProvider)
+    {
+        bool resetting = false;
+        InputComponent? input = null;
+
+        input = new InputComponent(
+            "Yeni Özel Komut Oluştur",
+            defaultValue: "",
+            validator: raw =>
+            {
+                var parsed = ParseTriggers(raw);
+                return parsed.Count > 0;
+            },
+            onChanged: change =>
+            {
+                if (resetting) return;
+
+                var triggers = ParseTriggers(change.NewValue);
+                if (triggers.Count == 0)
+                    return;
+
+                resetting = true;
+                input?.SetValue(change.Session, "");
+                resetting = false;
+
+                var entry = CreateAndSaveCommand(change.Player, triggers);
+                var player = change.Player;
+
+                _core.Scheduler.NextWorldUpdate(() =>
+                {
+                    if (!PlayerHelper.IsUsable(player)) return;
+                    var listMenu = listMenuProvider();
+                    var editMenu = BuildCommandEditMenu(ownerSlot, entry, listMenu);
+                    editMenu.Parent = listMenu ?? change.Session.Menu;
+                    editMenu.Open(player);
+                });
+            },
+            id: "create_new_cmd")
+        {
+            MaxLength = 128,
+            EmptyText = "Sohbete Yaz",
+            HintMessage = "[gold]Yeni komut tetikleyicisini sohbete yazın[default] (örn: [lime]dc[default] veya [lime]dc,discord[default])",
+            InvalidText = "Geçersiz tetikleyici",
+            AcceptedText = "Oluşturuldu"
+        };
+
+        return input;
+    }
+
+    private CustomCommandEntry CreateAndSaveCommand(IPlayer admin, List<string> triggers)
+    {
+        var id = NextUniqueId(triggers[0]);
+        var entry = new CustomCommandEntry
+        {
+            Id = id,
+            Title = $"!{triggers[0]} Komutu",
+            Description = $"!{triggers[0]} özel komutu",
+            Enabled = true,
+            Triggers = triggers,
+            Target = "caller",
+            CooldownSeconds = 2.0f,
+            Chat = $"[lime]!{triggers[0]}[default] komutu çalıştırıldı!"
+        };
+
+        _config.Commands.Add(entry);
+        SaveAndApply(reRegisterCommands: true);
+        _service.Reply(admin, $"[lime]{entry.TriggersDisplay}[default] komutu oluşturuldu! Şimdi çıktı ve aksiyonlarını düzenleyebilirsiniz.");
+        return entry;
+    }
+
+    // ============================== 3. HAZIR ŞABLONLAR ==============================
+
+    private IMenu BuildTemplatesMenu(int ownerSlot)
+    {
+        IMenu? templatesMenu = null;
+
+        IMenu OpenTemplate(CustomCommandEntry template, IPlayer admin)
+        {
+            _config.Commands.Add(template);
+            SaveAndApply(reRegisterCommands: true);
+            _service.Reply(admin, $"[lime]{template.TriggersDisplay}[default] şablon komutu eklendi ve kaydedildi!");
+            return BuildCommandEditMenu(ownerSlot, template, templatesMenu);
+        }
+
+        var builder = _core.Menu.CreateMenu("customcommands.templates")
+            .WithTitle("HAZIR KOMUT ŞABLONLARI")
+            .AddHeader(new TextComponent("Tek seçimle sunucuya hazır komut ekleyin"))
+            .Add(new SubmenuComponent("!dc / !discord\tDiscord Davet", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("discord"),
+                Title = "Discord Sunucusu",
+                Description = "Discord davet adresini gösterir.",
+                Triggers = ["dc", "discord"],
+                Target = "caller",
+                CooldownSeconds = 3.0f,
+                Chat = "💬 [lime]Discord Sunucumuz:[default] [lightblue]{DISCORD}[default]",
+                Html = "<font class='fontSize-m' color='#38BDF8'><b>💬 DISCORD</b></font><br><font class='fontSize-sm' color='#4ADE80'><b>{DISCORD}</b></font>"
+            }, ctx.Player)))
+            .Add(new SubmenuComponent("!kill / !intihar\tAnında İntihar", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("intihar"),
+                Title = "İntihar Et (!kill)",
+                Description = "Hayattayken intihar etmenizi sağlar.",
+                Triggers = ["kill", "intihar", "slayme"],
+                AliveState = "alive",
+                CooldownSeconds = 5.0f,
+                HideChat = true,
+                Target = "caller",
+                PlayerAction = "suicide",
+                Chat = "💀 [lightred]İntihar ettiniz![default]"
+            }, ctx.Player)))
+            .Add(new SubmenuComponent("!gelherkes\tsw_bring @all", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("gel_herkes"),
+                Title = "Herkesi Yanına Çek (!gelherkes)",
+                Description = "Tüm oyuncuları komutu yazan yetkilinin yanına çeker.",
+                Triggers = ["gelherkes", "herkesigetir", "bringall"],
+                Permission = "admin",
+                AliveState = "alive",
+                CooldownSeconds = 2.0f,
+                HideChat = true,
+                Target = "all",
+                ClientCommands = ["sw_bring @all"],
+                Chat = "⚡ Yetkili [lime]{NAME}[default] tüm oyuncuları yanına çekti!"
+            }, ctx.Player)))
+            .Add(new SubmenuComponent("!spec / !afk\tİzleyiciye Geç", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("izleyici_gec"),
+                Title = "İzleyiciye Geç (!spec)",
+                Description = "İzleyici takımına geçirir.",
+                Triggers = ["spec", "afk", "izleyici"],
+                CooldownSeconds = 3.0f,
+                HideChat = true,
+                Target = "caller",
+                PlayerAction = "spec",
+                Chat = "👁️ [lightblue]İzleyici takımına geçtiniz.[default]"
+            }, ctx.Player)))
+            .Add(new SubmenuComponent("!rr / !restart\tmp_restartgame 1", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("raunt_yenile"),
+                Title = "Maçı Yeniden Başlat (!rr)",
+                Description = "Maçı 1 saniye içinde yeniden başlatır.",
+                Triggers = ["rr", "restart"],
+                Permission = "admin",
+                HideChat = true,
+                Target = "all",
+                ServerCommands = ["mp_restartgame 1"],
+                Chat = "🔄 Yetkili [lime]{NAME}[default] maçı yeniden başlattı!"
+            }, ctx.Player)))
+            .Add(new SubmenuComponent("!hp / !heal\tVIP Can 100", ctx => OpenTemplate(new CustomCommandEntry
+            {
+                Id = NextUniqueId("vip_can"),
+                Title = "VIP Can Doldur (!hp)",
+                Description = "VIP oyuncuların canını 100 yapar.",
+                Triggers = ["hp", "heal", "can"],
+                Permission = "vip",
+                AliveState = "alive",
+                CooldownSeconds = 30.0f,
+                HideChat = true,
+                Target = "caller",
+                PlayerAction = "hp:100",
+                Chat = "🩺 [lime]Canınız 100 olarak yenilendi![default]"
+            }, ctx.Player)));
+
+        templatesMenu = Track(ownerSlot, builder.Build());
+        return templatesMenu;
+    }
+
+    // ============================== 4. KOMUT DÜZENLEME ==============================
+
+    private IMenu BuildCommandEditMenu(int ownerSlot, CustomCommandEntry cmd, IMenu? parentForDelete)
+    {
+        int targetIdx = Array.FindIndex(TargetValues, t => t.Equals(cmd.Target, StringComparison.OrdinalIgnoreCase));
+        if (targetIdx < 0) targetIdx = 0;
+
+        int aliveIdx = Array.FindIndex(AliveValues, a => a.Equals(cmd.AliveState, StringComparison.OrdinalIgnoreCase));
+        if (aliveIdx < 0) aliveIdx = 0;
+
+        int permIdx = Array.FindIndex(PermissionPresets, p => p.Equals(cmd.Permission ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+        if (permIdx < 0) permIdx = 0;
+
+        int actIdx = Array.FindIndex(ActionPresets, a => a.Equals(cmd.PlayerAction ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+        if (actIdx < 0) actIdx = 0;
+
+        int teamPresetIdx = GetTeamPresetIndex(cmd.Teams);
+
+        int hideChatIdx = cmd.HideChat switch
+        {
+            true => 1,
+            false => 2,
+            _ => 0
+        };
+
+        bool syncingPerm = false;
+        bool syncingAction = false;
+        bool syncingHtml = false;
+        bool syncingChat = false;
+        bool syncingCenter = false;
+        bool syncingClient = false;
+        bool syncingServer = false;
+
+        SelectorComponent<string>? permSelector = null;
+        InputComponent? permInput = null;
+        SelectorComponent<string>? actionSelector = null;
+        InputComponent? actionInput = null;
+        InputComponent? chatInput = null;
+        InputComponent? htmlInput = null;
+        InputComponent? centerInput = null;
+        InputComponent? clientCmdInput = null;
+        InputComponent? serverCmdInput = null;
+
+        permSelector = new SelectorComponent<string>(
+            "Yetki Ön Ayarı",
+            PermissionPresets,
+            permIdx,
+            change =>
+            {
+                if (syncingPerm) return;
+                syncingPerm = true;
+                cmd.Permission = string.IsNullOrEmpty(change.NewValue) ? null : change.NewValue;
+                permInput?.SetValue(change.Session, cmd.Permission ?? "");
+                syncingPerm = false;
+                SaveAndApply();
+            })
+        {
+            DefaultValueProvider = _ =>
+            {
+                int i = Array.FindIndex(PermissionPresets, p => p.Equals(cmd.Permission ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+                return i >= 0 ? i : 0;
+            },
+            Formatter = v => v switch
+            {
+                "" => "Herkes",
+                "!vip" => "!vip (VIP Hariç)",
+                _ => v
+            }
+        };
+
+        permInput = new InputComponent(
+            "Özel Yetki",
+            defaultValue: cmd.Permission ?? "",
+            onChanged: change =>
+            {
+                if (syncingPerm) return;
+                syncingPerm = true;
+                var trimmed = change.NewValue.Trim();
+                cmd.Permission = trimmed == "-" ? null : trimmed;
+                permInput?.SetValue(change.Session, SafePreview(cmd.Permission, 32));
+                int matchIdx = Array.FindIndex(PermissionPresets, p => p.Equals(cmd.Permission ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+                permSelector?.SetValue(change.Session, matchIdx >= 0 ? matchIdx : 0);
+                syncingPerm = false;
+                SaveAndApply();
+                _service.Reply(change.Player, $"Yetki güncellendi: [lime]{cmd.Permission ?? "Herkes"}[default]");
+            })
+        {
+            MaxLength = 64,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(cmd.Permission, 32),
+            HintMessage = "[gold]Gereken yetkiyi yazın[default] (örn: [lime]admin[default], [lime]vip[default], [lime]!vip[default] veya kaldırmak için [lightred]-[default])"
+        };
+
+        actionSelector = new SelectorComponent<string>(
+            "Dahili Aksiyon Ön Ayarı",
+            ActionPresets,
+            actIdx,
+            change =>
+            {
+                if (syncingAction) return;
+                syncingAction = true;
+                cmd.PlayerAction = string.IsNullOrEmpty(change.NewValue) ? null : change.NewValue;
+                actionInput?.SetValue(change.Session, cmd.PlayerAction ?? "");
+                syncingAction = false;
+                SaveAndApply();
+            })
+        {
+            DefaultValueProvider = _ =>
+            {
+                int i = Array.FindIndex(ActionPresets, a => a.Equals(cmd.PlayerAction ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+                return i >= 0 ? i : 0;
+            },
+            Formatter = v => v switch
+            {
+                "" => "Yok",
+                "suicide" => "İntihar (suicide)",
+                "spec" => "İzleyici (spec)",
+                "t" => "T Takımı (t)",
+                "ct" => "CT Takımı (ct)",
+                "respawn" => "Doğur (respawn)",
+                "strip" => "Silah Sil (strip)",
+                "freeze" => "Dondur (freeze)",
+                "unfreeze" => "Çöz (unfreeze)",
+                "noclip" => "Noclip Aç/Kapat",
+                "hp:100" => "Can 100 (hp:100)",
+                "armor:100" => "Zırh 100 (armor:100)",
+                _ => v
+            }
+        };
+
+        actionInput = new InputComponent(
+            "Özel Oyuncu Aksiyonu",
+            defaultValue: cmd.PlayerAction ?? "",
+            onChanged: change =>
+            {
+                if (syncingAction) return;
+                syncingAction = true;
+                var trimmed = change.NewValue.Trim();
+                cmd.PlayerAction = trimmed == "-" ? null : trimmed;
+                actionInput?.SetValue(change.Session, SafePreview(cmd.PlayerAction, 32));
+                int matchIdx = Array.FindIndex(ActionPresets, a => a.Equals(cmd.PlayerAction ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+                actionSelector?.SetValue(change.Session, matchIdx >= 0 ? matchIdx : 0);
+                syncingAction = false;
+                SaveAndApply();
+                _service.Reply(change.Player, $"Oyuncu aksiyonu güncellendi: [lime]{cmd.PlayerAction ?? "Yok"}[default]");
+            })
+        {
+            MaxLength = 64,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(cmd.PlayerAction, 32),
+            HintMessage = "[gold]Oyuncu aksiyonunu yazın[default] (örn: [lime]suicide, spec, hp:100, speed:1.5[default] veya kaldırmak için [lightred]-[default])"
+        };
+
+        chatInput = new InputComponent(
+            "Chat Mesajı",
+            defaultValue: "",
+            onChanged: change =>
+            {
+                if (syncingChat) return;
+                syncingChat = true;
+                var val = change.NewValue.Trim();
+                cmd.ChatLines.Clear();
+                cmd.Chat = val == "-" ? null : change.NewValue;
+                chatInput?.SetValue(change.Session, SafePreview(cmd.Chat));
+                syncingChat = false;
+                SaveAndApply();
+                _service.Reply(change.Player, "Chat mesajı güncellendi.");
+            })
+        {
+            MaxLength = 256,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(cmd.Chat ?? cmd.ChatLines.FirstOrDefault()),
+            HintMessage = "[gold]Chat mesajını yazın[default] (kaldırmak için [lightred]-[default] yazın)"
+        };
+
+        htmlInput = new InputComponent(
+            "CenterHTML Mesajı",
+            defaultValue: "",
+            onChanged: change =>
+            {
+                if (syncingHtml) return;
+                syncingHtml = true;
+                var val = change.NewValue.Trim();
+                cmd.Html = val == "-" ? null : change.NewValue;
+                htmlInput?.SetValue(change.Session, SafePreview(cmd.Html));
+                syncingHtml = false;
+                SaveAndApply();
+                _service.Reply(change.Player, "CenterHTML mesajı güncellendi.");
+            })
+        {
+            MaxLength = 512,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(cmd.Html),
+            HintMessage = "[gold]CenterHTML mesajını yazın[default] (kaldırmak için [lightred]-[default] yazın)"
+        };
+
+        centerInput = new InputComponent(
+            "Center Mesajı",
+            defaultValue: "",
+            onChanged: change =>
+            {
+                if (syncingCenter) return;
+                syncingCenter = true;
+                var val = change.NewValue.Trim();
+                cmd.Center = val == "-" ? null : change.NewValue;
+                centerInput?.SetValue(change.Session, SafePreview(cmd.Center));
+                syncingCenter = false;
+                SaveAndApply();
+                _service.Reply(change.Player, "Center mesajı güncellendi.");
+            })
+        {
+            MaxLength = 256,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(cmd.Center),
+            HintMessage = "[gold]Center mesajını yazın[default] (kaldırmak için [lightred]-[default] yazın)"
+        };
+
+        clientCmdInput = new InputComponent(
+            "Oyuncu Komutu (client_commands)",
+            defaultValue: "",
+            onChanged: change =>
+            {
+                if (syncingClient) return;
+                syncingClient = true;
+                var val = change.NewValue.Trim();
+                cmd.ClientCommands = val == "-"
+                    ? []
+                    : change.NewValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                clientCmdInput?.SetValue(change.Session, SafePreview(string.Join(" ; ", cmd.ClientCommands)));
+                syncingClient = false;
+                SaveAndApply();
+                _service.Reply(change.Player, "Oyuncu komutu (client_commands) güncellendi.");
+            })
+        {
+            MaxLength = 256,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(string.Join(" ; ", cmd.ClientCommands)),
+            HintMessage = "[gold]Oyuncuya çalıştırılacak komutu yazın[default] ([lime];[default] ile birden fazla, silmek için [lightred]-[default])"
+        };
+
+        serverCmdInput = new InputComponent(
+            "Sunucu Komutu (server_commands)",
+            defaultValue: "",
+            onChanged: change =>
+            {
+                if (syncingServer) return;
+                syncingServer = true;
+                var val = change.NewValue.Trim();
+                cmd.ServerCommands = val == "-"
+                    ? []
+                    : change.NewValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                serverCmdInput?.SetValue(change.Session, SafePreview(string.Join(" ; ", cmd.ServerCommands)));
+                syncingServer = false;
+                SaveAndApply();
+                _service.Reply(change.Player, "Sunucu komutu (server_commands) güncellendi.");
+            })
+        {
+            MaxLength = 256,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(string.Join(" ; ", cmd.ServerCommands)),
+            HintMessage = "[gold]Sunucu konsolunda çalıştırılacak komutu yazın[default] ([lime];[default] ile birden fazla, silmek için [lightred]-[default])"
+        };
+
+        var editMenu = _core.Menu.CreateMenu("customcommands.edit")
+            .WithTitle($"KOMUT: {SafePreview(cmd.TriggersDisplay, 24)}")
+            .AddHeader(new TextComponent
+            {
+                TextProvider = _ => $"{SafePreview(cmd.Label, 24)} • {cmd.SummaryTag()}"
+            })
+            .Add(new ToggleComponent("Durum (Aktif)", cmd.Enabled, change =>
+            {
+                cmd.Enabled = change.NewValue;
+                SaveAndApply(reRegisterCommands: true);
+            })
+            {
+                DefaultValueProvider = _ => cmd.Enabled
+            })
+            .Add(new ButtonComponent("Şimdi Test Et / Çalıştır", ctx =>
+            {
+                CloseTree(ctx.Session);
+                _service.Execute(ctx.Player, cmd, cmd.PrimaryTrigger, Array.Empty<string>(), bypassChecks: true);
+                return ValueTask.CompletedTask;
+            }))
+            .Add(new InputComponent(
+                "Tetikleyiciler",
+                defaultValue: string.Join(", ", cmd.Triggers),
+                validator: raw => ParseTriggers(raw).Count > 0,
+                onChanged: change =>
+                {
+                    var list = ParseTriggers(change.NewValue);
+                    if (list.Count > 0)
+                    {
+                        cmd.Triggers = list;
+                        SaveAndApply(reRegisterCommands: true);
+                        _service.Reply(change.Player, $"Tetikleyiciler güncellendi: [lime]{cmd.TriggersDisplay}[default]");
+                    }
+                })
+            {
+                MaxLength = 128,
+                DefaultValueProvider = _ => string.Join(", ", cmd.Triggers),
+                HintMessage = "[gold]Komut tetikleyicilerini virgülle yazın[default] (örn: [lime]dc, discord[default])"
+            })
+            .Add(permSelector)
+            .Add(permInput)
+            .Add(new SelectorComponent<string>("Çıktı Hedefi (Target)", TargetValues, targetIdx, change =>
+            {
+                cmd.Target = change.NewValue;
+                cmd.PrintTo = null;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ =>
+                {
+                    int i = Array.FindIndex(TargetValues, t => t.Equals(cmd.Target, StringComparison.OrdinalIgnoreCase));
+                    return i >= 0 ? i : 0;
+                },
+                Formatter = v => v switch
+                {
+                    "all" => "Tüm Sunucu",
+                    "team" => "Sadece Takımı",
+                    _ => "Sadece Yazan"
+                }
+            })
+            .Add(chatInput)
+            .Add(htmlInput)
+            .Add(centerInput)
+            .Add(clientCmdInput)
+            .Add(serverCmdInput)
+            .Add(actionSelector)
+            .Add(actionInput)
+            .Add(new SelectorComponent<string>("Hayatta Olma Şartı", AliveValues, aliveIdx, change =>
+            {
+                cmd.AliveState = change.NewValue;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ =>
+                {
+                    int i = Array.FindIndex(AliveValues, a => a.Equals(cmd.AliveState, StringComparison.OrdinalIgnoreCase));
+                    return i >= 0 ? i : 0;
+                },
+                Formatter = v => v switch
+                {
+                    "alive" => "Sadece Yaşayan",
+                    "dead" => "Sadece Ölü",
+                    _ => "Farketmez"
+                }
+            })
+            .Add(new SelectorComponent<int>("Takım Filtresi", [0, 1, 2, 3], teamPresetIdx, change =>
+            {
+                cmd.Teams = change.NewValue switch
+                {
+                    1 => ["T"],
+                    2 => ["CT"],
+                    3 => ["SPEC"],
+                    _ => []
+                };
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => GetTeamPresetIndex(cmd.Teams),
+                Formatter = idx => idx switch
+                {
+                    1 => "Sadece T",
+                    2 => "Sadece CT",
+                    3 => "Sadece İzleyici",
+                    _ => "Herkes"
+                }
+            })
+            .Add(new SliderComponent("Bekleme Süresi (Cooldown)", 0f, 120f, cmd.CooldownSeconds, 1f, change =>
+            {
+                cmd.CooldownSeconds = MathF.Round(change.NewValue, 1);
+                SaveAndApply();
+            })
+            {
+                TotalBars = 10,
+                ValueFormat = "0 sn",
+                DefaultValueProvider = _ => Math.Clamp(cmd.CooldownSeconds, 0f, 120f)
+            })
+            .Add(new SelectorComponent<int>("Sohbette Gizle (hide_chat)", [0, 1, 2], hideChatIdx, change =>
+            {
+                cmd.HideChat = change.NewValue switch
+                {
+                    1 => true,
+                    2 => false,
+                    _ => null
+                };
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => cmd.HideChat switch { true => 1, false => 2, _ => 0 },
+                Formatter = idx => idx switch
+                {
+                    1 => "EVET (Gizle)",
+                    2 => "HAYIR (Göster)",
+                    _ => "Genel Ayar"
+                }
+            })
+            .Add(new InputComponent("Başlık (Title)", defaultValue: SafePreview(cmd.Label, 32), onChanged: change =>
+            {
+                cmd.Title = change.NewValue.Trim();
+                SaveAndApply();
+                _service.Reply(change.Player, $"Başlık [lime]{cmd.Title}[default] olarak güncellendi.");
+            })
+            {
+                MaxLength = 64,
+                DefaultValueProvider = _ => SafePreview(cmd.Label, 32),
+                HintMessage = "[gold]Yeni komut başlığını sohbete yazın[default]"
+            })
+            .Add(new DangerSubmenuComponent("Bu Komutu Sil", _ => BuildConfirmDeleteMenu(ownerSlot, cmd, parentForDelete), "delete"))
+            .Build();
+
+        return Track(ownerSlot, editMenu);
+    }
+
+    private IMenu BuildConfirmDeleteMenu(int ownerSlot, CustomCommandEntry cmd, IMenu? parentToJumpBack)
+    {
+        IMenu? confirmMenu = null;
+
+        confirmMenu = _core.Menu.CreateMenu("customcommands.confirm_delete")
+            .WithTitle($"SİL: {SafePreview(cmd.TriggersDisplay, 24)}")
+            .AddHeader(new TextComponent($"{SafePreview(cmd.Label, 28)} komutu kalıcı olarak silinecek."))
+            .Add(new ButtonComponent("Evet, Kalıcı Olarak Sil", ctx =>
+            {
+                _config.Commands.Remove(cmd);
+                SaveAndApply(reRegisterCommands: true);
+                _service.Reply(ctx.Player, $"[lightred]'{cmd.TriggersDisplay}' komutu silindi.[default]");
+                if (confirmMenu != null && parentToJumpBack != null)
+                {
+                    confirmMenu.Parent = parentToJumpBack;
+                }
+                ctx.Session.Close();
+                return ValueTask.CompletedTask;
+            })
+            {
+                FocusedColor = "#F87171"
+            })
+            .Add(new ButtonComponent("Vazgeç", ctx =>
+            {
+                ctx.Session.Close();
+                return ValueTask.CompletedTask;
+            }))
+            .Build();
+
+        return Track(ownerSlot, confirmMenu);
+    }
+
+    // ============================== 5. GENEL AYARLAR ==============================
+
+    private IMenu BuildSettingsMenu(int ownerSlot)
+    {
+        var s = _config.Settings;
+        bool syncingPrefix = false;
+        InputComponent? prefixInput = null;
+
+        prefixInput = new InputComponent("Ön Ek Metni", defaultValue: SafePreview(s.Prefix, 32), onChanged: change =>
+        {
+            if (syncingPrefix) return;
+            syncingPrefix = true;
+            s.Prefix = change.NewValue.Trim();
+            prefixInput?.SetValue(change.Session, SafePreview(s.Prefix, 32));
+            syncingPrefix = false;
+            SaveAndApply();
+            _service.Reply(change.Player, $"Ön ek güncellendi: {s.Prefix}");
+        })
+        {
+            MaxLength = 64,
+            EmptyText = "Yok",
+            DefaultValueProvider = _ => SafePreview(s.Prefix, 32),
+            HintMessage = "[gold]Yeni ön eki sohbete yazın[default] (örn: [gold][Sunucu][default])"
+        };
+
+        var menu = _core.Menu.CreateMenu("customcommands.settings")
+            .WithTitle("GENEL AYARLAR")
+            .AddHeader(new TextComponent("Değişiklikler anında kaydedilir ve uygulanır"))
+            .Add(new ToggleComponent("Özel Komut Sistemi", s.Enabled, change =>
+            {
+                s.Enabled = change.NewValue;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => s.Enabled
+            })
+            .Add(new ToggleComponent("Sohbet Ön Eki (enable_prefix)", s.EnablePrefix, change =>
+            {
+                s.EnablePrefix = change.NewValue;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => s.EnablePrefix
+            })
+            .Add(prefixInput)
+            .Add(new ToggleComponent("Komutları Sohbette Gizle", s.HideChatTriggers, change =>
+            {
+                s.HideChatTriggers = change.NewValue;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => s.HideChatTriggers
+            })
+            .Add(new SliderComponent("Varsayılan Cooldown", 0f, 60f, s.DefaultCooldownSeconds, 0.5f, change =>
+            {
+                s.DefaultCooldownSeconds = MathF.Round(change.NewValue, 1);
+                SaveAndApply();
+            })
+            {
+                TotalBars = 10,
+                ValueFormat = "0.0 sn",
+                DefaultValueProvider = _ => Math.Clamp(s.DefaultCooldownSeconds, 0f, 60f)
+            })
+            .Add(new ToggleComponent("Admin/Root Yetkiden Muaf", s.RootBypassesPermissions, change =>
+            {
+                s.RootBypassesPermissions = change.NewValue;
+                SaveAndApply();
+            })
+            {
+                DefaultValueProvider = _ => s.RootBypassesPermissions
+            })
+            .Add(new InputComponent("Discord Adresi ({DISCORD})", defaultValue: SafePreview(s.DiscordInvite, 32), onChanged: change =>
+            {
+                s.DiscordInvite = change.NewValue.Trim();
+                SaveAndApply();
+                _service.Reply(change.Player, $"Discord adresi güncellendi: [lightblue]{s.DiscordInvite}[default]");
+            })
+            {
+                MaxLength = 128,
+                DefaultValueProvider = _ => SafePreview(s.DiscordInvite, 32),
+                HintMessage = "[gold]Yeni Discord davet adresini sohbete yazın[default]"
+            })
+            .Add(new InputComponent("Web Sitesi ({WEBSITE})", defaultValue: SafePreview(s.WebsiteUrl, 32), onChanged: change =>
+            {
+                s.WebsiteUrl = change.NewValue.Trim();
+                SaveAndApply();
+                _service.Reply(change.Player, $"Web sitesi güncellendi: [lime]{s.WebsiteUrl}[default]");
+            })
+            {
+                MaxLength = 128,
+                DefaultValueProvider = _ => SafePreview(s.WebsiteUrl, 32),
+                HintMessage = "[gold]Yeni Web sitesi adresini sohbete yazın[default]"
+            })
+            .Add(new InputComponent("Sunucu Domain ({DOMAIN})", defaultValue: SafePreview(s.ServerDomain, 32), onChanged: change =>
+            {
+                s.ServerDomain = change.NewValue.Trim();
+                SaveAndApply();
+                _service.Reply(change.Player, $"Domain güncellendi: [gold]{s.ServerDomain}[default]");
+            })
+            {
+                MaxLength = 128,
+                DefaultValueProvider = _ => SafePreview(s.ServerDomain, 32),
+                HintMessage = "[gold]Yeni sunucu domain/IP adresini sohbete yazın[default]"
+            })
+            .Build();
+
+        return Track(ownerSlot, menu);
+    }
+
+    // ============================== YARDIMCILAR ==============================
 
     private void SaveAndApply(bool reRegisterCommands = false)
     {
@@ -575,215 +1060,6 @@ public sealed class CustomCommandAdminMenu
             _onCommandsChanged();
     }
 
-    // ============================== MENU PAGES ==============================
-
-    private Page BuildMainPage(IPlayer admin)
-    {
-        int activeCount = _config.Commands.Count(c => c.Enabled);
-        return new Page
-        {
-            Title = "CustomCommands Yönetim",
-            Subtitle = $"{activeCount}/{_config.Commands.Count} aktif özel komut • Durum: {(_config.Settings.Enabled ? "AÇIK" : "KAPALI")}",
-            Rows =
-            {
-                new Row("📋 Özel Komutları Yönet", $"{_config.Commands.Count} komut", Style: RowStyle.Accent,
-                    OnSelect: p => _sessions[p.Slot].Push(BuildCommandsListPage)),
-
-                new Row("➕ Yeni Özel Komut Oluştur", Style: RowStyle.Accent,
-                    OnSelect: StartCreateCommandFlow),
-
-                new Row("⚡ Hazır Şablonlardan Komut Ekle", Style: RowStyle.Accent,
-                    OnSelect: p => _sessions[p.Slot].Push(BuildTemplatesPage)),
-
-                new Row("🔧 Genel Ayarlar", _config.Settings.Enabled ? "AÇIK" : "KAPALI",
-                    Style: _config.Settings.Enabled ? RowStyle.On : RowStyle.Off,
-                    OnSelect: p => _sessions[p.Slot].Push(BuildSettingsPage)),
-
-                new Row("🔄 Config Dosyasını Yeniden Yükle (Reload)", Style: RowStyle.Accent,
-                    OnSelect: p => _onReloadRequested(p)),
-
-                new Row("❌ Menüyü Kapat", Style: RowStyle.Danger, OnSelect: Close)
-            }
-        };
-    }
-
-    private Page BuildCommandsListPage(IPlayer admin)
-    {
-        var rows = new List<Row>
-        {
-            new("➕ Yeni Özel Komut Oluştur", Style: RowStyle.Accent, OnSelect: StartCreateCommandFlow)
-        };
-
-        foreach (var cmd in _config.Commands.ToList())
-        {
-            var entry = cmd;
-            var permBadge = string.IsNullOrWhiteSpace(entry.Permission) && entry.Permissions.Count == 0
-                ? "Herkes"
-                : entry.Permission ?? string.Join(",", entry.Permissions);
-
-            rows.Add(new Row(
-                Label: $"{entry.TriggersDisplay} ({entry.Label})",
-                Value: $"{(entry.Enabled ? "AKTİF" : "KAPALI")} • {permBadge} • {entry.SummaryTag()}",
-                Style: entry.Enabled ? RowStyle.On : RowStyle.Off,
-                OnSelect: a => _sessions[a.Slot].Push(_ => BuildCommandEditPage(entry))));
-        }
-
-        if (_config.Commands.Count == 0)
-            rows.Add(new Row("Kayıtlı özel komut bulunmuyor", Style: RowStyle.Muted));
-
-        return new Page
-        {
-            Title = "Özel Komut Listesi",
-            Subtitle = "Düzenlemek veya test etmek istediğiniz komutu seçin",
-            Rows = rows
-        };
-    }
-
-    private void StartCreateCommandFlow(IPlayer admin)
-    {
-        PromptInput(admin, "Yeni komutun tetikleyicisini yazın (örn: dc veya gelherkes veya dc,discord):", (adm, rawTriggers) =>
-        {
-            var triggers = rawTriggers
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(ConfigLoader.NormalizeTrigger)
-                .Where(t => t.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            if (triggers.Count == 0)
-            {
-                _service.Reply(adm, "[lightred]Geçerli bir komut adı girmediniz.[default]");
-                return;
-            }
-
-            var baseId = triggers[0];
-            var id = baseId;
-            int suffix = 2;
-            while (_config.Commands.Any(c => c.Id.Equals(id, StringComparison.OrdinalIgnoreCase)))
-            {
-                id = $"{baseId}_{suffix++}";
-            }
-
-            var entry = new CustomCommandEntry
-            {
-                Id = id,
-                Title = $"!{triggers[0]} Komutu",
-                Description = $"!{triggers[0]} özel komutu",
-                Enabled = true,
-                Triggers = triggers,
-                Target = "caller",
-                CooldownSeconds = 2.0f,
-                Chat = $"[lime]!{triggers[0]}[default] komutu çalıştırıldı!"
-            };
-
-            _config.Commands.Add(entry);
-            SaveAndApply(reRegisterCommands: true);
-            _service.Reply(adm, $"[lime]{entry.TriggersDisplay}[default] komutu oluşturuldu! Şimdi çıktı ve aksiyonlarını düzenleyebilirsiniz.");
-
-            if (_sessions.TryGetValue(adm.Slot, out var session))
-                session.Push(_ => BuildCommandEditPage(entry));
-        });
-    }
-
-    private Page BuildTemplatesPage(IPlayer admin)
-    {
-        return new Page
-        {
-            Title = "Hazır Komut Şablonları",
-            Subtitle = "Tek tuşla sunucunuza hazır özel komut ekleyin",
-            Rows =
-            {
-                new Row("💬 !dc / !discord (Discord Davet)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("discord"),
-                        Title = "Discord Sunucusu",
-                        Description = "Discord davet adresini gösterir.",
-                        Triggers = new List<string> { "dc", "discord" },
-                        Target = "caller",
-                        CooldownSeconds = 3.0f,
-                        Chat = "💬 [lime]Discord Sunucumuz:[default] [lightblue]{DISCORD}[default]",
-                        Html = "<font class='fontSize-m' color='#38BDF8'><b>💬 DISCORD</b></font><br><font class='fontSize-sm' color='#4ADE80'><b>{DISCORD}</b></font>"
-                    })),
-
-                new Row("💀 !kill / !intihar (Anında İntihar)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("intihar"),
-                        Title = "İntihar Et (!kill)",
-                        Description = "Hayattayken intihar etmenizi sağlar.",
-                        Triggers = new List<string> { "kill", "intihar", "slayme" },
-                        AliveState = "alive",
-                        CooldownSeconds = 5.0f,
-                        HideChat = true,
-                        Target = "caller",
-                        PlayerAction = "suicide",
-                        Chat = "💀 [lightred]İntihar ettiniz![default]"
-                    })),
-
-                new Row("⚡ !gelherkes (Admin: sw_bring @all)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("gel_herkes"),
-                        Title = "Herkesi Yanına Çek (!gelherkes)",
-                        Description = "Tüm oyuncuları komutu yazan yetkilinin yanına çeker.",
-                        Triggers = new List<string> { "gelherkes", "herkesigetir", "bringall" },
-                        Permission = "admin",
-                        AliveState = "alive",
-                        CooldownSeconds = 2.0f,
-                        HideChat = true,
-                        Target = "all",
-                        ClientCommands = new List<string> { "sw_bring @all" },
-                        Chat = "⚡ Yetkili [lime]{NAME}[default] tüm oyuncuları yanına çekti!"
-                    })),
-
-                new Row("👁️ !spec / !afk (İzleyiciye Geç)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("izleyici_gec"),
-                        Title = "İzleyiciye Geç (!spec)",
-                        Description = "İzleyici takımına geçirir.",
-                        Triggers = new List<string> { "spec", "afk", "izleyici" },
-                        CooldownSeconds = 3.0f,
-                        HideChat = true,
-                        Target = "caller",
-                        PlayerAction = "spec",
-                        Chat = "👁️ [lightblue]İzleyici takımına geçtiniz.[default]"
-                    })),
-
-                new Row("🔄 !rr / !restart (Admin: mp_restartgame 1)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("raunt_yenile"),
-                        Title = "Maçı Yeniden Başlat (!rr)",
-                        Description = "Maçı 1 saniye içinde yeniden başlatır.",
-                        Triggers = new List<string> { "rr", "restart" },
-                        Permission = "admin",
-                        HideChat = true,
-                        Target = "all",
-                        ServerCommands = new List<string> { "mp_restartgame 1" },
-                        Chat = "🔄 Yetkili [lime]{NAME}[default] maçı yeniden başlattı!"
-                    })),
-
-                new Row("🩺 !hp / !heal (VIP: Can 100 Yap)", Style: RowStyle.Accent,
-                    OnSelect: a => AddTemplateCommand(a, new CustomCommandEntry
-                    {
-                        Id = NextUniqueId("vip_can"),
-                        Title = "VIP Can Doldur (!hp)",
-                        Description = "VIP oyuncuların canını 100 yapar.",
-                        Triggers = new List<string> { "hp", "heal", "can" },
-                        Permission = "vip",
-                        AliveState = "alive",
-                        CooldownSeconds = 30.0f,
-                        HideChat = true,
-                        Target = "caller",
-                        PlayerAction = "hp:100",
-                        Chat = "🩺 [lime]Canınız 100 olarak yenilendi![default]"
-                    }))
-            }
-        };
-    }
-
     private string NextUniqueId(string baseId)
     {
         var id = baseId;
@@ -793,289 +1069,14 @@ public sealed class CustomCommandAdminMenu
         return id;
     }
 
-    private void AddTemplateCommand(IPlayer admin, CustomCommandEntry template)
+    private static List<string> ParseTriggers(string? raw)
     {
-        _config.Commands.Add(template);
-        SaveAndApply(reRegisterCommands: true);
-        _service.Reply(admin, $"[lime]{template.TriggersDisplay}[default] şablon komutu eklendi ve kaydedildi!");
-        if (_sessions.TryGetValue(admin.Slot, out var session))
-            session.Push(_ => BuildCommandEditPage(template));
-    }
-
-    private Page BuildCommandEditPage(CustomCommandEntry cmd)
-    {
-        int targetIdx = Array.FindIndex(TargetValues, t => t.Equals(cmd.Target, StringComparison.OrdinalIgnoreCase));
-        if (targetIdx < 0) targetIdx = 0;
-
-        int aliveIdx = Array.FindIndex(AliveValues, a => a.Equals(cmd.AliveState, StringComparison.OrdinalIgnoreCase));
-        if (aliveIdx < 0) aliveIdx = 0;
-
-        int teamIdx = GetTeamPresetIndex(cmd.Teams);
-
-        int permIdx = Array.FindIndex(PermissionPresets, p => p.Equals(cmd.Permission ?? string.Empty, StringComparison.OrdinalIgnoreCase));
-        string permDisplay = string.IsNullOrWhiteSpace(cmd.Permission) ? "Herkes" : cmd.Permission!;
-
-        int actIdx = Array.FindIndex(ActionPresets, a => a.Equals(cmd.PlayerAction ?? string.Empty, StringComparison.OrdinalIgnoreCase));
-        string actDisplay = actIdx >= 0
-            ? ActionPresetLabels[actIdx]
-            : (string.IsNullOrWhiteSpace(cmd.PlayerAction) ? "Yok" : cmd.PlayerAction!);
-
-        string hideChatLabel = cmd.HideChat switch
-        {
-            null => "Genel Ayar",
-            true => "EVET (Gizle)",
-            false => "HAYIR (Göster)"
-        };
-
-        var rows = new List<Row>
-        {
-            new("Durum", cmd.Enabled ? "AKTİF" : "KAPALI", Arrows: true,
-                Style: cmd.Enabled ? RowStyle.On : RowStyle.Off,
-                OnAdjust: (_, _) => { cmd.Enabled = !cmd.Enabled; SaveAndApply(reRegisterCommands: true); }),
-
-            new("🚀 Şimdi Test Et / Çalıştır", Style: RowStyle.Accent,
-                OnSelect: a =>
-                {
-                    Close(a);
-                    _service.Execute(a, cmd, cmd.PrimaryTrigger, Array.Empty<string>(), bypassChecks: true);
-                }),
-
-            new("⌨️ Tetikleyiciler (E ile Yaz)", cmd.TriggersDisplay, Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Komut tetikleyicilerini virgülle yazın (örn: dc, discord):", (adm, val) =>
-                {
-                    var list = val.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .Select(ConfigLoader.NormalizeTrigger)
-                        .Where(x => x.Length > 0)
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-                    if (list.Count > 0)
-                    {
-                        cmd.Triggers = list;
-                        SaveAndApply(reRegisterCommands: true);
-                        _service.Reply(adm, $"Tetikleyiciler güncellendi: [lime]{cmd.TriggersDisplay}[default]");
-                    }
-                })),
-
-            new("🔑 Gereken Yetki (A/D veya E ile Yaz)", permDisplay, Arrows: true, Style: RowStyle.Accent,
-                OnAdjust: (_, dir) =>
-                {
-                    int baseIdx = permIdx >= 0 ? permIdx : 0;
-                    int next = ((baseIdx + dir) % PermissionPresets.Length + PermissionPresets.Length) % PermissionPresets.Length;
-                    cmd.Permission = string.IsNullOrEmpty(PermissionPresets[next]) ? null : PermissionPresets[next];
-                    SaveAndApply();
-                },
-                OnSelect: a => PromptInput(a, "Gereken yetkiyi yazın (örn: admin, vip, !vip veya herkes için -):", (adm, val) =>
-                {
-                    cmd.Permission = val == "-" ? null : val.Trim();
-                    SaveAndApply();
-                    _service.Reply(adm, $"Yetki güncellendi: [lime]{cmd.Permission ?? "Herkes"}[default]");
-                })),
-
-            new("📡 Çıktı Hedefi (Target)", TargetLabels[targetIdx], Arrows: true, Style: RowStyle.Accent,
-                OnAdjust: (_, dir) =>
-                {
-                    int next = ((targetIdx + dir) % TargetValues.Length + TargetValues.Length) % TargetValues.Length;
-                    cmd.Target = TargetValues[next];
-                    cmd.PrintTo = null;
-                    SaveAndApply();
-                }),
-
-            new("💬 Chat Mesajı (E ile Yaz)", ShortPreview(cmd.Chat ?? cmd.ChatLines.FirstOrDefault()), Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Chat mesajını yazın (kaldırmak için - yazın):", (adm, val) =>
-                {
-                    cmd.ChatLines.Clear();
-                    cmd.Chat = val == "-" ? null : val;
-                    SaveAndApply();
-                    _service.Reply(adm, "Chat mesajı güncellendi.");
-                })),
-
-            new("🖥️ CenterHTML Mesajı (E ile Yaz)", ShortPreview(cmd.Html), Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "CenterHTML mesajını yazın (kaldırmak için - yazın):", (adm, val) =>
-                {
-                    cmd.Html = val == "-" ? null : val;
-                    SaveAndApply();
-                    _service.Reply(adm, "CenterHTML mesajı güncellendi.");
-                })),
-
-            new("🎯 Center Mesajı (E ile Yaz)", ShortPreview(cmd.Center), Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Center mesajını yazın (kaldırmak için - yazın):", (adm, val) =>
-                {
-                    cmd.Center = val == "-" ? null : val;
-                    SaveAndApply();
-                    _service.Reply(adm, "Center mesajı güncellendi.");
-                })),
-
-            new("👤 Oyuncu Komutu (client_commands)", cmd.ClientCommands.Count > 0 ? string.Join(" ; ", cmd.ClientCommands) : "Yok", Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Oyuncuya çalıştırılacak komutu yazın (örn: sw_bring @all | silmek için -):", (adm, val) =>
-                {
-                    cmd.ClientCommands = val == "-"
-                        ? new List<string>()
-                        : val.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-                    SaveAndApply();
-                    _service.Reply(adm, "Oyuncu komutu (client_commands) güncellendi.");
-                })),
-
-            new("🖧 Sunucu Komutu (server_commands)", cmd.ServerCommands.Count > 0 ? string.Join(" ; ", cmd.ServerCommands) : "Yok", Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Sunucu konsolunda çalıştırılacak komutu yazın (örn: mp_restartgame 1 | silmek için -):", (adm, val) =>
-                {
-                    cmd.ServerCommands = val == "-"
-                        ? new List<string>()
-                        : val.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-                    SaveAndApply();
-                    _service.Reply(adm, "Sunucu komutu (server_commands) güncellendi.");
-                })),
-
-            new("⚡ Dahili Oyuncu Aksiyonu (A/D veya E)", actDisplay, Arrows: true, Style: RowStyle.Accent,
-                OnAdjust: (_, dir) =>
-                {
-                    int baseIdx = actIdx >= 0 ? actIdx : 0;
-                    int next = ((baseIdx + dir) % ActionPresets.Length + ActionPresets.Length) % ActionPresets.Length;
-                    cmd.PlayerAction = string.IsNullOrEmpty(ActionPresets[next]) ? null : ActionPresets[next];
-                    SaveAndApply();
-                },
-                OnSelect: a => PromptInput(a, "Oyuncu aksiyonunu yazın (suicide, spec, t, ct, respawn, strip, freeze, hp:100 veya -):", (adm, val) =>
-                {
-                    cmd.PlayerAction = val == "-" ? null : val.Trim();
-                    SaveAndApply();
-                    _service.Reply(adm, $"Oyuncu aksiyonu güncellendi: [lime]{cmd.PlayerAction ?? "Yok"}[default]");
-                })),
-
-            new("❤️ Hayatta Olma Şartı", AliveLabels[aliveIdx], Arrows: true,
-                OnAdjust: (_, dir) =>
-                {
-                    int next = ((aliveIdx + dir) % AliveValues.Length + AliveValues.Length) % AliveValues.Length;
-                    cmd.AliveState = AliveValues[next];
-                    SaveAndApply();
-                }),
-
-            new("🚩 Takım Filtresi", TeamPresetLabels[teamIdx], Arrows: true,
-                OnAdjust: (_, dir) =>
-                {
-                    int next = ((teamIdx + dir) % TeamPresets.Length + TeamPresets.Length) % TeamPresets.Length;
-                    cmd.Teams = TeamPresets[next].ToList();
-                    SaveAndApply();
-                }),
-
-            new("⏱️ Bekleme Süresi (Cooldown)", $"{cmd.CooldownSeconds:0.0} sn", Arrows: true,
-                OnAdjust: (_, dir) =>
-                {
-                    cmd.CooldownSeconds = Math.Clamp(cmd.CooldownSeconds + dir * 1.0f, 0f, 300f);
-                    SaveAndApply();
-                }),
-
-            new("🙈 Sohbette Gizle (hide_chat)", hideChatLabel, Arrows: true,
-                OnAdjust: (_, _) =>
-                {
-                    cmd.HideChat = cmd.HideChat switch
-                    {
-                        null => true,
-                        true => false,
-                        false => null
-                    };
-                    SaveAndApply();
-                }),
-
-            new("✏️ Başlık (Title)", cmd.Label, Style: RowStyle.Accent,
-                OnSelect: a => PromptInput(a, "Yeni komut başlığını yazın:", (adm, val) =>
-                {
-                    cmd.Title = val;
-                    SaveAndApply();
-                    _service.Reply(adm, $"Başlık [lime]{val}[default] olarak güncellendi.");
-                })),
-
-            new("🗑️ Bu Komutu Sil", Style: RowStyle.Danger,
-                OnSelect: a =>
-                {
-                    _config.Commands.Remove(cmd);
-                    SaveAndApply(reRegisterCommands: true);
-                    _service.Reply(a, $"[lightred]'{cmd.TriggersDisplay}' komutu silindi.[default]");
-                    if (_sessions.TryGetValue(a.Slot, out var s)) s.Back();
-                })
-        };
-
-        return new Page
-        {
-            Title = $"Komut: {cmd.TriggersDisplay}",
-            Subtitle = $"{cmd.Label} • {cmd.SummaryTag()}",
-            Rows = rows
-        };
-    }
-
-    private Page BuildSettingsPage(IPlayer admin)
-    {
-        var s = _config.Settings;
-
-        return new Page
-        {
-            Title = "Genel Ayarlar",
-            Subtitle = "Değişiklikler anında kaydedilir ve uygulanır",
-            Rows =
-            {
-                new Row("Özel Komut Sistemi", s.Enabled ? "AÇIK" : "KAPALI", Arrows: true,
-                    Style: s.Enabled ? RowStyle.On : RowStyle.Off,
-                    OnAdjust: (_, _) => { s.Enabled = !s.Enabled; SaveAndApply(); }),
-
-                new Row("Sohbet Ön Eki (enable_prefix)", s.EnablePrefix ? "AÇIK" : "KAPALI", Arrows: true,
-                    Style: s.EnablePrefix ? RowStyle.On : RowStyle.Off,
-                    OnAdjust: (_, _) => { s.EnablePrefix = !s.EnablePrefix; SaveAndApply(); }),
-
-                new Row("✏️ Ön Ek Metnini Düzenle (E)", s.Prefix, Style: RowStyle.Accent,
-                    OnSelect: a => PromptInput(a, "Yeni ön eki yazın (örn: [gold][Sunucu][default]):", (adm, val) =>
-                    {
-                        s.Prefix = val;
-                        SaveAndApply();
-                        _service.Reply(adm, $"Ön ek güncellendi: {s.Prefix}");
-                    })),
-
-                new Row("Komut Mesajlarını Sohbette Gizle", s.HideChatTriggers ? "AÇIK" : "KAPALI", Arrows: true,
-                    Style: s.HideChatTriggers ? RowStyle.On : RowStyle.Off,
-                    OnAdjust: (_, _) => { s.HideChatTriggers = !s.HideChatTriggers; SaveAndApply(); }),
-
-                new Row("Varsayılan Cooldown", $"{s.DefaultCooldownSeconds:0.0} sn", Arrows: true,
-                    OnAdjust: (_, dir) =>
-                    {
-                        s.DefaultCooldownSeconds = Math.Clamp(s.DefaultCooldownSeconds + dir * 0.5f, 0f, 60f);
-                        SaveAndApply();
-                    }),
-
-                new Row("Admin/Root Tüm Yetkilerden Geçsin", s.RootBypassesPermissions ? "EVET" : "HAYIR", Arrows: true,
-                    Style: s.RootBypassesPermissions ? RowStyle.On : RowStyle.Off,
-                    OnAdjust: (_, _) => { s.RootBypassesPermissions = !s.RootBypassesPermissions; SaveAndApply(); }),
-
-                new Row("✏️ Discord Adresi ({DISCORD})", s.DiscordInvite, Style: RowStyle.Accent,
-                    OnSelect: a => PromptInput(a, "Yeni Discord davet adresini yazın:", (adm, val) =>
-                    {
-                        s.DiscordInvite = val;
-                        SaveAndApply();
-                        _service.Reply(adm, $"Discord adresi güncellendi: [lightblue]{val}[default]");
-                    })),
-
-                new Row("✏️ Web Sitesi ({WEBSITE})", s.WebsiteUrl, Style: RowStyle.Accent,
-                    OnSelect: a => PromptInput(a, "Yeni Web sitesi adresini yazın:", (adm, val) =>
-                    {
-                        s.WebsiteUrl = val;
-                        SaveAndApply();
-                        _service.Reply(adm, $"Web sitesi güncellendi: [lime]{val}[default]");
-                    })),
-
-                new Row("✏️ Sunucu Domain ({DOMAIN})", s.ServerDomain, Style: RowStyle.Accent,
-                    OnSelect: a => PromptInput(a, "Yeni sunucu domain/IP adresini yazın:", (adm, val) =>
-                    {
-                        s.ServerDomain = val;
-                        SaveAndApply();
-                        _service.Reply(adm, $"Domain güncellendi: [gold]{val}[default]");
-                    })),
-
-                new Row("Menü Açıkken Oyuncuyu Dondur", s.FreezeWhileMenuOpen ? "AÇIK" : "KAPALI", Arrows: true,
-                    Style: s.FreezeWhileMenuOpen ? RowStyle.On : RowStyle.Off,
-                    OnAdjust: (adm, _) =>
-                    {
-                        s.FreezeWhileMenuOpen = !s.FreezeWhileMenuOpen;
-                        SetFrozen(adm, s.FreezeWhileMenuOpen);
-                        SaveAndApply();
-                    })
-            }
-        };
+        if (string.IsNullOrWhiteSpace(raw)) return [];
+        return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ConfigLoader.NormalizeTrigger)
+            .Where(t => t.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private static int GetTeamPresetIndex(List<string> teams)
@@ -1090,11 +1091,74 @@ public sealed class CustomCommandAdminMenu
         return 0;
     }
 
-    private static string ShortPreview(string? text)
+    private static string SafePreview(string? text, int maxLen = 28)
     {
-        if (string.IsNullOrWhiteSpace(text)) return "Yok";
-        var clean = ColorHelper.StripAll(text).Replace("\n", " ").Trim();
-        return clean.Length > 24 ? clean[..24] + "..." : clean;
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+        var clean = ColorHelper.StripAll(text);
+        clean = HtmlTagRegex.Replace(clean, " ");
+        clean = clean.Replace("<", "").Replace(">", "").Replace("\r", " ").Replace("\n", " ").Trim();
+        while (clean.Contains("  ", StringComparison.Ordinal))
+            clean = clean.Replace("  ", " ", StringComparison.Ordinal);
+
+        if (clean.Length == 0) return "(HTML)";
+        return clean.Length > maxLen ? clean[..maxLen] + "..." : clean;
+    }
+
+    private static void CloseTree(IMenuSession session)
+    {
+        var menu = session.Menu;
+        var parent = menu.Parent;
+        menu.Parent = null;
+        session.Close();
+        menu.Parent = parent;
+    }
+
+    private static void ReplaceRows(IMenu menu, PageState page, IReadOnlyList<IMenuComponent> rows)
+    {
+        foreach (var row in page.Rows)
+            menu.Remove(row);
+        page.Rows.Clear();
+
+        for (int i = 0; i < rows.Count; i++)
+        {
+            menu.Insert(MenuRegion.Body, page.RowsAt + i, rows[i]);
+            page.Rows.Add(rows[i]);
+        }
+    }
+
+    private static void RestoreFocus(IMenuSession session, PageState page)
+    {
+        if (page.FocusKey is { } key && FocusWhere(session, c => c is MenuComponentBase { Tag: { } tag } && tag.Equals(key)))
+            return;
+
+        if (page.Focus is { } focus)
+        {
+            for (int i = focus; i > 0; i--)
+            {
+                if (session.FocusedIndex == i || session.SetFocus(i))
+                    return;
+            }
+        }
+    }
+
+    private static bool FocusWhere(IMenuSession session, Func<IMenuComponent, bool> match)
+    {
+        int index = 0;
+        foreach (var component in session.Menu.GetComponents(MenuRegion.Body))
+        {
+            if (!component.IsFocusable || !component.IsVisible(session))
+                continue;
+
+            if (match(component))
+            {
+                if (session.FocusedIndex != index)
+                    session.SetFocus(index);
+                return true;
+            }
+
+            index++;
+        }
+
+        return false;
     }
 }
-
